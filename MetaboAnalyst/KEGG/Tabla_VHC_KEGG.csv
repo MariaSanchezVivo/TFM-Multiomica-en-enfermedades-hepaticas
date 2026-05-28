@@ -1,0 +1,20 @@
+;total;expected;hits;Raw p;Holm p;FDR
+Arginine biosynthesis;14;0.138;2;0.00774;0.627;0.36
+Butanoate metabolism;15;0.148;2;0.00888;0.71;0.36
+Citrate cycle (TCA cycle);20;0.197;2;0.0156;1;0.422
+One carbon pool by folate;26;0.257;2;0.0258;1;0.481
+Alanine,  aspartate and glutamate metabolism;28;0.276;2;0.0297;1;0.481
+Glycine,  serine and threonine metabolism;32;0.316;2;0.0381;1;0.514
+Pyrimidine metabolism;39;0.385;2;0.0546;1;0.632
+Taurine and hypotaurine metabolism;8;0.079;1;0.0765;1;0.774
+Nicotinate and nicotinamide metabolism;15;0.148;1;0.139;1;1
+Purine metabolism;70;0.691;2;0.15;1;1
+Propanoate metabolism;22;0.217;1;0.197;1;1
+Glutathione metabolism;28;0.276;1;0.245;1;1
+Lipoic acid metabolism;28;0.276;1;0.245;1;1
+Lysine degradation;29;0.286;1;0.252;1;1
+Arginine and proline metabolism;35;0.346;1;0.296;1;1
+Glycerophospholipid metabolism;36;0.355;1;0.303;1;1
+Valine,  leucine and isoleucine degradation;40;0.395;1;0.331;1;1
+Tryptophan metabolism;40;0.395;1;0.331;1;1
+Primary bile acid biosynthesis;46;0.454;1;0.371;1;1
