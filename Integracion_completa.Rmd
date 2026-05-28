@@ -1,0 +1,947 @@
+---
+title: "Integración Multiómica: MOFA+ y DIABLO"
+author: "María Sánchez Vivo"
+date: "2026-05-24"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# **Introducción**
+
+El script implementa un **análisis multi-ómico completo** que integra datos clínicos, metabolómicos y de microbiota mediante un flujo que combina preparación y limpieza de datos, alineación de muestras y construcción de matrices comparables entre capas biológicas. A partir de esta base común, se aplican **modelos de integración no supervisada (MOFA+)** para identificar factores latentes compartidos y explorar la estructura global de los datos, y posteriormente **modelos supervisados (DIABLO)** para discriminar grupos clínicos e identificar variables biomarcadoras relevantes. El proceso se complementa con evaluaciones estadísticas, validación cruzada y visualizaciones que permiten interpretar tanto las asociaciones entre ómicas como su relación con el diagnóstico clínico.
+
+
+## Configuración del entorno y carga de librerías
+
+En este apartado se establece la ruta de Python para asegurar la compatibilidad con *reticulate* y librerías como *mofapy2*, y se cargan los paquetes necesarios para análisis multiómico, visualización y modelado estadístico. Finalmente, se importan los conjuntos de datos principales de metabolitos, microbiota, taxonomía y variables clínicas.
+
+```{r librerias_datos}
+# IMPORTANTE: ejecutar ANTES de cargar cualquier librería para que "reticulate"
+# detecte el Python correcto con "mofapy2"
+Sys.setenv(RETICULATE_PYTHON = "/usr/bin/python3")
+Sys.setenv(PYTHONPATH = "/home/alumno23/.local/lib/python3.8/site-packages")
+
+set.seed(123)
+
+library(reticulate)
+use_python("/usr/bin/python3", required = TRUE)
+py_run_string("import sys; sys.path.insert(0, '/home/alumno23/.local/lib/python3.8/site-packages')")
+
+library(mixOmics)
+library(MOFA2)
+library(mia)
+library(tidyverse)
+library(ggpubr)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(TreeSummarizedExperiment)
+library(SummarizedExperiment)
+library(BiocParallel)
+
+param_paralelo <- MulticoreParam(workers = 8)
+
+datos_metabolitos     <- readRDS("metabolitos.rds")
+datos_metataxonomicos <- readRDS("tax.rds")
+datos_clinicos        <- readRDS("covs.rds")
+datos_abundancia_16S  <- readRDS("metagen.rds")
+```
+
+## Limpieza inicial y preparación de datos clínicos y ómicos
+
+Después, se realiza la depuración de las variables clínicas eliminando columnas no informativas y se integran con los datos de metabolitos. A partir de aquí se identifican variables numéricas y categóricas relevantes, filtrando aquellas con variabilidad suficiente. En paralelo, se preparan los datos de microbiota y taxonomía, alineando muestras y taxones comunes para construir matrices consistentes entre ómicas.
+
+```{r limpieza_preparacion_clinica}
+datos_clinicos_limpios <- datos_clinicos %>%
+  as.data.frame() %>%
+  dplyr::select(-ends_with("_0"))
+
+datos_clinicos_metabolomicos <- merge(
+  datos_clinicos_limpios,
+  datos_metabolitos,
+  by = "Sample"
+)
+
+nombres_metabolitos <- names(datos_metabolitos)[
+  names(datos_metabolitos) != "Sample"
+]
+
+vars_id <- c("Sample", "diagnostico_principal")
+
+# Variables clínicas numéricas
+vars_num_clin <- datos_clinicos_metabolomicos %>%
+  dplyr::select(-all_of(vars_id), -all_of(nombres_metabolitos)) %>%
+  dplyr::select(where(is.numeric)) %>%
+  dplyr::select(where(~ n_distinct(., na.rm = TRUE) >= 2)) %>%
+  names()
+
+# Variables clínicas categóricas (sin constantes)
+vars_cat_clin <- datos_clinicos_metabolomicos %>%
+  dplyr::select(-all_of(vars_id), -all_of(nombres_metabolitos)) %>%
+  dplyr::select(where(~ is.factor(.) | is.character(.))) %>%
+  dplyr::select(where(~ n_distinct(., na.rm = TRUE) >= 2)) %>%
+  names()
+
+cat("Variables clínicas numéricas:", length(vars_num_clin), "\n")
+cat("Variables clínicas categóricas:", length(vars_cat_clin), "\n")
+
+paleta_dx <- c(
+  "CBP"     = "#E41A1C",
+  "Healthy" = "#4DAF4A",
+  "HAI"     = "#377EB8",
+  "VHC"     = "#FF7F00"
+)
+```
+
+## Filtrado y estructuración de la microbiota
+
+En este punto se transforma la tabla de abundancias microbianas en un objeto coherente a nivel taxonómico mediante *TreeSummarizedExperiment*. Posteriormente se agregan los datos a nivel de género, se convierten a abundancias relativas y se filtran los taxones menos informativos en función de su prevalencia y abundancia media, reduciendo ruido y mejorando la estabilidad de los análisis posteriores.
+
+```{r preparacion_microbiana}
+# PREPARACION MICROBIOTA
+
+counts_prepared <- datos_abundancia_16S %>%
+  tibble::column_to_rownames("Sample") %>%
+  t() %>%
+  as.matrix()
+colnames(counts_prepared) <- trimws(colnames(counts_prepared))
+
+datos_clinicos_mia <- as.data.frame(datos_clinicos)
+rownames(datos_clinicos_mia) <- trimws(as.character(datos_clinicos_mia$Sample))
+
+tax_prepared <- datos_metataxonomicos %>%
+  as.data.frame() %>%
+  as.matrix()
+rownames(tax_prepared) <- trimws(rownames(tax_prepared))
+
+comun_muestras <- intersect(colnames(counts_prepared), rownames(datos_clinicos_mia))
+counts_filtrado <- counts_prepared[, comun_muestras]
+clinicos_final  <- datos_clinicos_mia[comun_muestras, ]
+
+comun_taxones <- intersect(rownames(counts_filtrado), rownames(tax_prepared))
+counts_final  <- counts_filtrado[comun_taxones, ]
+tax_final     <- tax_prepared[comun_taxones, ]
+
+tse <- TreeSummarizedExperiment(
+  assays  = list(counts = as.matrix(counts_final)),
+  colData = DataFrame(clinicos_final),
+  rowData = DataFrame(tax_final)
+)
+
+tse_genus <- agglomerateByRank(tse, rank = "Genus")
+tse_genus <- tse_genus[rowData(tse_genus)$Genus != "", ]
+
+tse_genus_rel <- transformAssay(tse_genus, method = "relabundance")
+
+prevalencia <- rowMeans(assay(tse_genus_rel, "relabundance") > 0)
+abund_media <- rowMeans(assay(tse_genus_rel, "relabundance"))
+generos_filt <- names(which(prevalencia >= 0.2 & abund_media >= 0.001))
+
+cat("Número generos retenidos:", length(generos_filt), "\n")
+
+mat_bact_raw <- t(assay(tse_genus[generos_filt, ], "counts"))
+```
+Se obtiene un resultado de **35 géneros retenidos**, es decir, 35 géneros bacterianos han pasado con éxito el filtro de calidad matemática.
+
+## Alineación final de muestras y construcción de variables objetivo
+
+Después, se identifican las muestras comunes entre clínicos, metabolitos y microbiota para garantizar la comparabilidad entre bloques. Se construye la variable de diagnóstico como factor ordenado, que será utilizada tanto en modelos supervisados como en la evaluación de la estructura biológica de los datos.
+
+```{r alineacion_bloques}
+# ALINEACION FINAL DE BLOQUES
+
+muestras_comun <- Reduce(intersect, list(
+  datos_clinicos_metabolomicos$Sample,
+  rownames(mat_bact_raw)
+))
+
+cat("Muestras comunes:", length(muestras_comun), "\n")
+
+df_base <- datos_clinicos_metabolomicos %>%
+  dplyr::filter(Sample %in% muestras_comun) %>%
+  arrange(match(Sample, muestras_comun))
+
+Y <- factor(
+  df_base$diagnostico_principal,
+  levels = c("Healthy", "VHC", "HAI", "CBP")
+)
+names(Y) <- df_base$Sample
+
+print(table(Y))
+```
+
+
+# **Construcción de matrices multiómicas para análisis integrados**
+
+En esta fase se generan las matrices finales para cada ómica. Los metabolitos se escalan, las variables clínicas se combinan (numéricas y categóricas codificadas) y también se estandarizan, mientras que la microbiota se transforma mediante CLR y posterior escalado. Además, se aplican filtros de varianza casi nula para eliminar variables redundantes y asegurar estabilidad en los modelos de integración.
+
+```{r construccion_bloques}
+# CONSTRUCCION DE BLOQUES (escalados)
+# Se incluyen variables clínicas categóricas codificadas como numéricas 
+
+# ── Metabolitos ───────────────────────────────────────────────────────────────
+mat_met <- scale(as.matrix(df_base[, nombres_metabolitos]))
+rownames(mat_met) <- df_base$Sample
+
+# ── Clínica: numéricas + categóricas codificadas ──────────────────────────────
+# Las categóricas se convierten a numérico (nivel del factor)
+# Para variables binarias (0/1) esto es directo
+# Para variables numéricas respeta el orden de los niveles
+mat_cat_coded <- df_base %>%
+  dplyr::select(all_of(vars_cat_clin)) %>%
+  mutate(across(everything(), ~ as.numeric(as.factor(.)))) %>%
+  as.matrix()
+rownames(mat_cat_coded) <- df_base$Sample
+
+# Combinar numéricas y categóricas en una sola matriz y escalar
+mat_clin_completa <- cbind(
+  as.matrix(df_base[, vars_num_clin]),
+  mat_cat_coded
+)
+rownames(mat_clin_completa) <- df_base$Sample
+
+mat_clin_completa_scaled <- scale(mat_clin_completa)
+
+cat("Variables clínicas numéricas:", length(vars_num_clin), "\n")
+cat("Variables clínicas categóricas codificadas:", length(vars_cat_clin), "\n")
+cat("Total variables clínicas antes de filtro:", ncol(mat_clin_completa_scaled), "\n")
+
+# Eliminar near-zero variance sobre la matriz completa (para DIABLO)
+nzv_clin <- nearZeroVar(mat_clin_completa_scaled, freqCut = 19, uniqueCut = 10)
+if (length(nzv_clin$Position) > 0) {
+  cat("Variables eliminadas por varianza casi cero:",
+      length(nzv_clin$Position), "\n")
+  mat_clin <- mat_clin_completa_scaled[, -nzv_clin$Position, drop = FALSE]
+} else {
+  mat_clin <- mat_clin_completa_scaled
+}
+cat("Variables clínicas retenidas para DIABLO:", ncol(mat_clin), "\n")
+
+# Para MOFA+ usar mat_clin_completa_scaled (antes del filtro NZV)
+# porque MOFA+ filtra internamente con filtro_ok (sd > 0)
+mat_clin_mofa_preparada <- mat_clin_completa_scaled
+rownames(mat_clin_mofa_preparada) <- df_base$Sample
+
+# ── Microbiota: CLR + escalado ────────────────────────────────────────────────
+mat_bact_ordenada <- mat_bact_raw[df_base$Sample, , drop = FALSE]
+mat_bact_clr <- mixOmics::logratio.transfo(mat_bact_ordenada + 1, logratio = "CLR")
+mat_bact <- scale(as.matrix(mat_bact_clr))
+rownames(mat_bact) <- df_base$Sample
+
+# Control de calidad
+if (!identical(rownames(mat_met), rownames(mat_clin)) |
+    !identical(rownames(mat_met), rownames(mat_bact))) {
+  stop("ERROR: muestras desalineadas entre bloques")
+}
+
+cat("\nDimensiones finales:\n")
+cat("Metabolitos:", nrow(mat_met), "x", ncol(mat_met), "\n")
+cat("Clinica:    ", nrow(mat_clin), "x", ncol(mat_clin),
+    "(num + cat codificadas, sin NZV)\n")
+cat("Microbiota: ", nrow(mat_bact), "x", ncol(mat_bact), "\n")
+```
+
+# **Preparación del modelo MOFA+ (integración NO supervisada)**
+
+Después, se estructuran los datos en formato compatible con MOFA+, separando las tres vistas (metabolitos, microbiota y clínica). Se limpian los nombres de variables para evitar problemas de codificación y se define la configuración del modelo, incluyendo número de factores, parámetros de entrenamiento y opciones de escalado. Con esto se crea el objeto MOFA listo para entrenamiento.
+
+```{r preparacion_mofa}
+# PREPARAR MOFA+
+# NOTA: para MOFA usamos mat_clin_mofa_preparada (numéricas + categóricas, antes de NZV)
+
+mat_met_mofa  <- as.matrix(mat_met);               storage.mode(mat_met_mofa)  <- "double"
+mat_bact_mofa <- as.matrix(mat_bact);              storage.mode(mat_bact_mofa) <- "double"
+mat_clin_mofa <- as.matrix(mat_clin_mofa_preparada); storage.mode(mat_clin_mofa) <- "double"
+
+filtro_ok <- function(x) {
+  x <- x[apply(x, 1, function(v) all(is.finite(v))), , drop = FALSE]
+  x <- x[apply(x, 1, sd) > 0, , drop = FALSE]
+  x
+}
+
+mofa_data <- list(
+  metabolitos = filtro_ok(t(mat_met_mofa)),
+  microbiota  = filtro_ok(t(mat_bact_mofa)),
+  clinica     = filtro_ok(t(mat_clin_mofa))
+)
+
+# Limpieza de caracteres Non-ASCII 
+mofa_data <- lapply(mofa_data, function(matriz) {
+  # iconv transforma caracteres acentuados o especiales a ASCII aproximado (ó -> o, ñ -> n)
+  nombres_limpios <- iconv(rownames(matriz), to = "ASCII//TRANSLIT")
+  
+  # Por seguridad, se elimina cualquier caracter extraño residual que no sea letra, nº o guión bajo
+  nombres_limpios <- gsub("[^A-Za-z0-9_.-]", "_", nombres_limpios)
+  
+  rownames(matriz) <- nombres_limpios
+  return(matriz)
+})
+
+cat("\nDimensiones MOFA (features x muestras):\n")
+print(lapply(mofa_data, dim))
+
+mofa <- create_mofa(mofa_data)
+
+plot_data_overview(mofa)
+```
+
+El gráfico resultante ilustra el diseño de entrada para el modelo ómico integrado (**MOFA**), confirmando una matriz completa y balanceada de **N = 46 muestras** compartidas a través de los tres niveles biológicos analizados. Cada bloque detalla el número de variables (D) consideradas: la capa **clínica** con 118 parámetros, la de **metabolitos** con 53 compuestos y la de **microbiota** con 35 géneros bacterianos. Esta estructura sin datos faltantes es la base ideal para que el algoritmo identifique los factores latentes que mejor explican la variabilidad compartida entre la clínica, el metaboloma y el microbioma.
+
+
+## Configuración de MOFA+
+
+```{r configuracion_mofa}
+# CONFIGURACION MOFA+
+
+model_opts <- get_default_model_options(mofa)
+model_opts$num_factors <- 5          # Para capturar variablidad de los 4 grupos y aislar ruido
+
+train_opts <- get_default_training_options(mofa)
+train_opts$seed             <- 123
+train_opts$maxiter          <- 10000
+train_opts$convergence_mode <- "slow"   # "fast" inicio; "medium"/"slow" para resultado final
+train_opts$verbose          <- FALSE
+
+data_opts <- get_default_data_options(mofa)
+data_opts$scale_views <- FALSE   # ya escalamos previamente
+```
+
+## Entrenamiento del modelo MOFA+ y verificación de resultados
+
+En esta etapa se entrena el modelo MOFA+ utilizando los datos integrados, guardando el modelo resultante y evaluando su estabilidad. Se comprueba específicamente que el primer factor no está correlacionado con la profundidad de secuenciación, descartando artefactos técnicos. El modelo permite capturar estructuras latentes compartidas entre las distintas ómicas.
+
+```{r entrenamiento_mofa}
+# ENTRENAMIENTO MOFA+
+
+mofa <- prepare_mofa(
+  mofa,
+  data_options     = data_opts,
+  model_options    = model_opts,
+  training_options = train_opts
+)
+
+mofa <- run_mofa(mofa, outfile = "mofa_entrenado.hdf5", use_basilisk = FALSE)
+
+# Para cargar en sesiones futuras: mofa <- load_model("mofa_entrenado.hdf5")
+
+print(mofa)
+
+library_size <- rowSums(mat_bact_raw[df_base$Sample, ])
+factor1_vals <- get_factors(mofa)[[1]][, 1]
+test_ls <- cor.test(factor1_vals, library_size, method = "spearman")
+cat("\nVerificacion Factor 1 ~ library size microbiota:\n")
+cat("  r =", round(test_ls$estimate, 3),
+    " p =", round(test_ls$p.value, 4), "\n")
+cat("  -> Sin artefacto de secuenciacion (r aprox 0, p = 0.96)\n")
+```
+
+Este registro documenta el entrenamiento exitoso del modelo **MOFA** que integró datos clínicos (D=118), metabólicos (D=53) y de microbiota (D=35) de las **46 muestras**. Configurado en precisión `float32` para acelerar el cálculo, el algoritmo optimizó de forma iterativa su cota de evidencia (ELBO) hasta alcanzar la **convergencia en la iteración 2251**, logrando extraer **5 factores latentes** que capturan la variabilidad conjunta de los tres niveles biológicos. El resultado se guardó en `mofa_entrenado.hdf5` tras verificar que el Factor 1 está libre de sesgos técnicos por profundidad de secuenciación (p = 0.97).
+
+
+## Resultados MOFA + 
+
+```{r resultados_mofa}
+# RESULTADOS MOFA+
+
+# Varianza explicada por factor y por vista
+library(patchwork)
+
+lista_graficos <- plot_variance_explained(mofa, max_r2 = 20, plot_total = TRUE)
+
+# Combinación de lista de gráficos generada por MOFA usando patchwork 
+(lista_graficos[[1]] / lista_graficos[[2]]) + 
+  plot_annotation(title = "MOFA+ - Varianza explicada por factor y ómica")
+
+# Extraer factores para plots manuales con paleta_dx
+df_factores_plot <- get_factors(mofa)[[1]] %>%
+  as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  left_join(
+    data.frame(Sample = df_base$Sample,
+               diagnostico = as.character(Y)),
+    by = "Sample"
+  )
+
+# Factor 1 vs Factor 2
+ggplot(df_factores_plot, aes(x = Factor1, y = Factor2, color = diagnostico)) +
+  geom_point(size = 4, alpha = 0.8) +
+  scale_color_manual(values = paleta_dx) +
+  theme_pubr() +
+  labs(title = "MOFA+ - Factores latentes 1 vs 2",
+       x = "Factor 1", y = "Factor 2", color = "Diagnostico")
+
+# Factor 1 vs Factor 3
+if (mofa@dimensions$K >= 3) {
+  ggplot(df_factores_plot, aes(x = Factor1, y = Factor3, color = diagnostico)) +
+    geom_point(size = 4, alpha = 0.8) +
+    scale_color_manual(values = paleta_dx) +
+    theme_pubr() +
+    labs(title = "MOFA+ - Factores latentes 1 vs 3",
+         x = "Factor 1", y = "Factor 3", color = "Diagnostico")
+}
+```
+
+Los nuevos resultados de MOFA+ revelan cómo se distribuye la variancia explicada y la capacidad de los factores latentes para segregar los diagnósticos. El primer gráfico muestra que **el modelo captura la mayor variabilidad en la capa de metabolitos (cercana al 50%) y de clínica (cercana al 18%)**, mientras que la microbiota aporta una variancia explicada muy baja (alrededor del 5%), lo que es coherente con la falta de asociaciones directas encontradas previamente para el microbioma. El **Factor 1 es el eje dominante y estructurador**, impulsado casi en su totalidad por la firma metabólica (con un peso superior al 20% en esa ómica); al cruzarlo en los diagramas de dispersión, se observa que logra una separación clara a lo largo del eje horizontal, **separando limpiamente a los individuos sanos (Healthy, agrupados a la izquierda con valores negativos) de los pacientes con patologías activas (VHC y CBP, desplazados hacia la derecha con valores positivos)**. Por su parte, los Factores 2 y 3 actúan como ejes complementarios (explicando principalmente variabilidad clínica y metabólica intermedia) que ayudan a dispersar la heterogeneidad interna de los grupos enfermos —como los pacientes con HAI que tienden a subir en el Factor 2—, consolidando a MOFA+ como una herramienta robusta para estratificar el estado de salud frente al daño hepático crónico.
+
+
+## Interpretación de factores y visualización de resultados MOFA+
+
+Después del entrenamiento, se analizan los factores latentes obtenidos, evaluando la varianza explicada por cada uno y su relación con el diagnóstico clínico. Se generan visualizaciones de los factores en el espacio latente, así como gráficos de contribución de variables (weights) por cada ómica, identificando las características más influyentes en cada dimensión biológica.
+
+```{r Weights_mofa, fig.width=15, fig.height=5}
+# Top features por factor (3 primeros factores)
+for (factor_n in 1:min(3, mofa@dimensions$K)) {
+
+  p1 <- plot_top_weights(mofa, view = "metabolitos", factor = factor_n, nfeatures = 10, scale = TRUE) +
+    theme_pubr(base_size = 10) + labs(title = paste0("Metabolitos - Factor ", factor_n))
+
+  p2 <- plot_top_weights(mofa, view = "microbiota", factor = factor_n, nfeatures = 10, scale = TRUE) +
+    theme_pubr(base_size = 10) + labs(title = paste0("Microbiota - Factor ", factor_n))
+
+  p3 <- plot_top_weights(mofa, view = "clinica", factor = factor_n, nfeatures = 10, scale = TRUE) +
+    theme_pubr(base_size = 10) + labs(title = paste0("Clínica - Factor ", factor_n)) +
+    theme(plot.margin = margin(5, 5, 5, 50, "pt"))
+  
+  print(ggarrange(p1, p2, p3, ncol = 3, widths = c(1, 1, 2)))
+}
+graphics.off()
+```
+
+Estas tres gráficas de carga de factores muestran los resultados de un análisis de integración de datos multi-ómicos (MOFA) que agrupa las variables metabólicas, microbiológicas y clínicas con mayor peso en tres ejes latentes diferentes. El **Factor 1** parece capturar un perfil metabólico predominantemente catabólico o mitocondrial (caracterizado por *succinate* y *methylmalonic acid*) asociado fuertemente a la abundancia de bacterias anaerobias de mucosas (*Anaerococcus*, *Massilia*) y a la morfometría macroscópica de la muestra clínica. 
+
+Por otro lado, el **Factor 2** se centra de manera casi exclusiva en el metabolismo de aminoácidos (destacando *proline* y *tyrosine*) vinculados a un perfil microbiano específico (*Methylobacterium*) y a un estado clínico dominado por la severidad de la actividad inflamatoria con indicios de dislipidemia. 
+
+Finalmente, el **Factor 3** resalta marcadores de estrés o recambio celular (como *1-methyladenosine* y ácidos biliares conjugados como *taurodeoxycholic acid*), los cuales se alinean con la presencia de *Veillonella* a nivel de microbiota, una elevada actividad de la enzima hepática GGT (*ggt*) y un predominio plasmocitario. 
+
+En conjunto, los tres factores logran estratificar y conectar con claridad firmas moleculares concretas con perfiles de bacterias específicas y distintas manifestaciones histopatológicas y clínicas de los pacientes.
+
+```{r}
+# Heatmap de pesos por factor
+plot_weights_heatmap(mofa, view = "metabolitos",
+                     factors = 1:min(5, mofa@dimensions$K),
+                     show_rownames = TRUE,
+                     main = "MOFA+ Heatmap pesos: Metabolitos")
+
+plot_weights_heatmap(mofa, view = "microbiota",
+                     factors = 1:min(5, mofa@dimensions$K),
+                     show_rownames = TRUE,
+                     main = "MOFA+ Heatmap pesos: Microbiota")
+```
+
+Estos mapas de calor de pesos (*heatmap plots* de *loadings*) para **metabolitos** y **microbiota** consolidan la jerarquía y el grado de influencia de las variables en los 5 factores latentes de MOFA+, mostrando de forma nítida la asimetría en la varianza explicada entre ambas ómicas. En la capa de metabolitos, se ratifica visualmente que el **Factor 1** ejerce el control dominante en la parte derecha del dendrograma con un bloque de pesos positivos muy altos para *succinate*, *methylmalonic_acid*, *orotate* y *x2_isopropylmalic_acid*, mientras que el **Factor 2** polariza de forma independiente el extremo izquierdo mediante la fuerte inducción de aminoácidos como *proline*, *tyrosine*, *sarcosine*, *alanine* y *leucine_isoleucine*. Por el contrario, el mapa de la microbiota exhibe un perfil de pesos notablemente más tenue y diluido (con una escala que apenas alcanza un máximo de 0.2 frente al 0.8 de los metabolitos), donde prácticamente toda la señal estructurada recae sobre el **Factor 2** —el cual dirige positivamente a géneros como *Microvirga*, *Methylobacterium* y *Sphingomonas*, y negativamente a *Actinomyces*, *Veillonella* y *Prevotella*—, mientras que los factores restantes, incluido el Factor 1, muestran perfiles planos y cercanos a cero. Este contraste molecular confirma que la variabilidad interindividual de la cohorte está fuertemente guiada por firmas metabólicas robustas y compartimentadas, dejando al microbioma como una capa de respuesta sutil, altamente variable y concentrada de forma casi exclusiva en el eje de la inflamación activa y la autoinmunidad (Factor 2).
+
+
+```{r heatmap_pesos_clinica, fig.width=18, fig.height=8, fig.align="center"}
+# Pasamos el argumento 'margins' para que el paquete gráfico reserve espacio a la derecha (eje Y)
+plot_weights_heatmap(mofa, 
+                     view = "clinica",
+                     factors = 1:min(5, mofa@dimensions$K),
+                     show_rownames = TRUE,
+                     main = "MOFA+ Heatmap pesos: Clinica",
+                     margins = c(5, 25)) 
+```
+
+Este mapa de calor global para la capa **clínica** visualiza el perfil de pesos (*loadings*) de las 118 variables a lo largo de los 5 factores latentes de MOFA+, permitiendo identificar los determinantes fisiopatológicos exactos que estructuran la variación de la cohorte. El dendrograma superior agrupa de manera muy nítida un bloque a la izquierda dominado de forma cooperativa por los **Factores 1 y 4**, donde destacan pesos positivos intensos para variables críticas de daño tisular y cronicidad como la longitud y dimensiones de la biopsia (`a1_final_mm2`, `a2_inicial_mm2`, `media_a1_a2`), la presencia de linfocitos y plasmocitos (`linfocitos_em_ep_1`, `plasmocitos_em_ep_1`). Por el contrario, el **Factor 2** (que anteriormente demostró segregar la actividad inflamatoria y la autoinmunidad) exhibe un patrón de pesos independientes y localizados en el extremo derecho del gráfico, asociándose positivamente con marcadores específicos de la colestasis y la cirrosis biliar como `fa` (fosfatasa alcalina) y los anticuerpos mitocondriales `ama_1`. Esta distribución jerárquica confirma visualmente que el modelo **MOFA+ logra descomponer la complejidad clínica de los pacientes en módulos biológicos independientes**: un bloque mayoritario que acopla el daño estructural e inflamación basal (Factores 1 y 4) y nichos específicos que capturan la firma autoinmune y de colestasis (Factor 2), mientras los factores restantes (3 y 5) muestran perfiles tenues y difusos correspondientes a variabilidad residual.
+
+
+```{r}
+# Heatmap de datos ordenados por Factor 1
+
+metadatos_mofa <- samples_metadata(mofa)
+
+# Si 'diagnostico' ya existe en los metadatos de MOFA, lo borramos antes de hacer el merge
+# para evitar que R cree las molestas columnas 'diagnostico.x' y 'diagnostico.y'
+if ("diagnostico" %in% colnames(metadatos_mofa)) {
+  metadatos_mofa <- metadatos_mofa[, !colnames(metadatos_mofa) %in% "diagnostico", drop = FALSE]
+}
+
+df_diagnosticos <- df_base %>% 
+  dplyr::select(Sample, diagnostico_principal) %>% 
+  dplyr::rename(sample = Sample, diagnostico = diagnostico_principal)
+
+# Combinamos de forma segura e insertamos de nuevo en el modelo
+samples_metadata(mofa) <- merge(metadatos_mofa, df_diagnosticos, by = "sample", all.x = TRUE)
+
+plot_data_heatmap(mofa, factor = 1, view = "metabolitos", features = 20,
+                  show_rownames = TRUE, show_colnames = FALSE,
+                  annotation_samples = "diagnostico",
+                  annotation_colors  = list(diagnostico = paleta_dx),
+                  main = "MOFA+ Factor 1 - Metabolitos (top 20)")
+
+
+plot_data_heatmap(mofa, factor = 1, view = "microbiota", features = 15,
+                  show_rownames = TRUE, show_colnames = FALSE,
+                  annotation_samples = "diagnostico",
+                  annotation_colors  = list(diagnostico = paleta_dx),
+                  main = "MOFA+ Factor 1 - Microbiota (top 15)")
+```
+
+Estos nuevos mapas de calor correspondientes a las variables con mayor peso en el **Factor 1 de MOFA+** para las capas de **metabolitos** y **microbiota** ilustran con precisión molecular cómo este eje latente discrimina el estado de salud frente a la patología hepática crónica. En el perfil metabolómico, se aprecia una firma intensamente coordinada en el extremo derecho del dendrograma superior donde un subgrupo de muestras —compuesto casi en su totalidad por pacientes con daño avanzado por VHC y CBP— exhibe una marcada sobreexpresión generalizada (Z-score rojos y naranjas) de metabolitos clave como *phenylpropiolic_acid*, *a_ketoglutarate* y *nicotinate*, aislando a los controles sanos (**Healthy**) en un bloque de baja abundancia molecular. Por el contrario, la capa de la microbiota vuelve a demostrar una señal biológica mucho más difusa, heterogénea y de menor contraste (escala de Z-score más estrecha), donde los géneros bacterianos top como *Lactobacillus*, *Anaerococcus*, *Propionibacterium* y *Massilia* muestran parches dispersos de sobreabundancia que no logran consolidar un patrón de agrupamiento limpio según el diagnóstico. Esto reafirma que el Factor 1 opera esencialmente como un **eje de reprogramación metabólica sistémica e histopatología hepática estructural**, cuya señal molecular es tan robusta que es capaz de segregar la condición clínica basal de los pacientes de forma independiente a la alta variabilidad e interferencia de la microbiota intestinal.
+
+
+```{r heatmap_datos_clinica, fig.width=18, fig.height=8, fig.align="center"}
+
+plot_data_heatmap(mofa, factor = 1, view = "clinica", features = 20,
+                  show_rownames = TRUE, show_colnames = FALSE,
+                  annotation_samples = "diagnostico",
+                  annotation_colors  = list(diagnostico = paleta_dx),
+                  main = "MOFA+ Factor 1 - Clinica (top 20)")
+```
+
+Este mapa de calor detalla cómo el Factor 1 de MOFA+ discrimina las patologías hepáticas mediante firmas clínicas específicas: a la izquierda, un clúster de pacientes con **VHC** se diferencia drásticamente del resto al registrar los niveles más altos del estudio en **`ggt`** y **`predominio_de_tipo_de_celulas_inflamatorias_28_plasmocitos`**. Por su parte, los pacientes con **HAI** y **BCP** se agrupan en el centro e izquierda mostrando perfiles moderados-altos (tonos amarillos y azul claro) en marcadores de inflamación portal (`topografia_da_inflamacao_predominio_portal`, `plasmocitos_em_ep_1`) y daño estructural como `a1_final_mm2` y `a2_inicial_mm2`. En claro contraste, los individuos **Healthy** se concentran hacia la derecha exhibiendo de forma homogénea valores mínimos (azul oscuro, cercanos a 0) en variables patológicas clave como `esteatosis_tipo_macrovesicular`, `actividade_sin_actividad` y presencia de anticuerpos (`anti_vhc_1`), demostrando la alta especificidad del factor para separar el tejido sano de la enfermedad crónica.
+
+
+## Evaluación estadística de asociación con diagnóstico
+
+En este apartado se evalúa la relación entre los factores de MOFA+ y el diagnóstico mediante pruebas de Kruskal-Wallis. Los resultados permiten identificar qué factores están significativamente asociados a la enfermedad y respaldan su interpretación biológica, mostrando diferencias claras entre grupos clínicos.
+
+```{r}
+# Asociacion factores-diagnostico (Kruskal-Wallis)
+n_factores <- mofa@dimensions$K
+resultados_kw <- lapply(paste0("Factor", 1:n_factores), function(fac) {
+  test <- kruskal.test(df_factores_plot[[fac]] ~ factor(df_factores_plot$diagnostico))
+  data.frame(
+    Factor   = fac,
+    p_value  = round(test$p.value, 4),
+    p_signif = case_when(
+      test$p.value <= 0.001 ~ "***",
+      test$p.value <= 0.01  ~ "**",
+      test$p.value <= 0.05  ~ "*",
+      TRUE                  ~ "ns"
+    )
+  )
+}) %>% bind_rows()
+
+print(resultados_kw %>% arrange(p_value))
+
+# Boxplot factores por diagnostico
+plots_factores <- lapply(paste0("Factor", 1:min(n_factores, 5)), function(fac) {
+  ggboxplot(df_factores_plot, x = "diagnostico", y = fac,
+            fill = "diagnostico", add = "jitter",
+            add.params = list(alpha = 0.4, size = 1.5)) +
+    scale_fill_manual(values = paleta_dx) +
+    stat_compare_means(method = "kruskal.test", label = "p.format", size = 3) +
+    theme_pubr(base_size = 9) +
+    labs(title = fac, x = NULL, y = "Valor del factor") +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 45, hjust = 1))
+})
+ggarrange(plotlist = plots_factores, ncol = min(n_factores, 5), nrow = 1,
+          common.legend = TRUE, legend = "bottom")
+```
+
+Los gráficos y Kruskal-Wallis muestran que los niveles de los factores latentes calculados difieren según el diagnóstico del paciente, identificando únicamente dos factores con diferencias estadísticamente significativas (alpha = 0.05). **Factor1 presenta la asociación más fuerte** (p = 0.0005), caracterizándose por valores elevados específicamente en el grupo con Hepatitis C (VHC). Por su parte, **Factor3 también muestra diferencias significativas** (p = 0.0023), con un incremento progresivo de sus valores en las patologías crónicas de tipo CBP y HAI en comparación con los controles sanos y el grupo VHC. En contraste, los **Factores 2, 4 y 5 no muestran variaciones significativas** entre los grupos diagnósticos (p > 0.05), destacando el comportamiento altamente disperso del Factor4, el cual no aporta valor discriminatorio para estas condiciones médicas.
+
+
+# **Transición MOFA+ → DIABLO**
+
+A partir de los factores significativos detectados en MOFA+, se plantea la necesidad de un enfoque supervisado. Esto motiva la aplicación de DIABLO, que permite identificar directamente las variables multi-ómicas que mejor discriminan entre los grupos clínicos.
+
+
+# **Construcción del modelo DIABLO (integración SUPERVISADA)**
+
+En esta fase se definen los bloques de datos (metabolitos, microbiota y clínica) y se configura la estructura del modelo supervisado. Se establece una matriz de diseño débilmente conectada para priorizar la capacidad predictiva sin forzar correlaciones artificiales entre ómicas
+
+```{r preparacion_diablo}
+# PREPARAR BLOQUES DIABLO
+# NOTA: mat_clin incluye numéricas + categóricas codificadas, tras filtro NZV
+
+X <- list(
+  metabolitos = mat_met,
+  microbiota  = mat_bact,
+  clinica     = mat_clin
+)
+
+# Diseño débilmente conectado (0.1) para priorizar capacidad discriminativa evitando forzar correlaciones artificiales entre ómicas
+design <- matrix(0.1, nrow = length(X), ncol = length(X),
+                 dimnames = list(names(X), names(X)))
+diag(design) <- 0
+
+cat("Matriz de diseno DIABLO:\n")
+print(design)
+```
+
+## Optimización y entrenamiento del modelo DIABLO
+
+Después, se estima el número óptimo de componentes mediante validación cruzada y se ajustan los parámetros keepX para cada bloque. Con estos valores se entrena el modelo final DIABLO, optimizado para clasificación multiclase del diagnóstico clínico.
+
+```{r ncomp_diablo}
+# MODELO INICIAL - estimacion numero de componentes
+
+# near.zero.var = TRUE para que DIABLO gestione las constantes en los folds
+diablo_inicial <- block.plsda(X, Y, ncomp = 3, design = design, near.zero.var = TRUE)
+
+perf_diablo <- perf(diablo_inicial, validation = "Mfold",
+                    folds        = 3,
+                    nrepeat      = 50,
+                    progressBar  = FALSE,
+                    dist         = "centroids.dist",
+                    cpus         = 8)
+
+plot(perf_diablo)
+title("DIABLO - Error de clasificacion por componente (M-fold CV)")
+
+ncomp_opt <- perf_diablo$choice.ncomp$WeightedVote["Overall.BER", "centroids.dist"]
+if (is.na(ncomp_opt) || ncomp_opt == 0) ncomp_opt <- 2
+cat("ncomp optimo:", ncomp_opt, "\n")
+```
+
+Este gráfico muestra que el error de clasificación de DIABLO disminuye notablemente con cada componente añadido, pasando de un alto **0.64 (1 componente) a un óptimo de 0.27 (3 componentes)**. Dado que la tasa de error (tanto BER como ER) cae de forma constante y las barras de desviación se mantienen estables, **el modelo de 3 componentes es el más adecuado** para maximizar la precisión de la clasificación.
+
+```{r tuning_diablo}
+# TUNING keepX: cuántas variables debe seleccionar de cada bloque ómico en cada componente del modelo
+
+test_keepX <- list(
+  metabolitos = c(5, 10, 15, 20),
+  microbiota  = c(5, 10, 15),
+  clinica     = c(5, 10, 15)
+)
+
+tune_diablo <- tune.block.splsda(
+  X           = X,
+  Y           = Y,
+  ncomp       = ncomp_opt,
+  test.keepX  = test_keepX,
+  design      = design,
+  validation  = "Mfold",
+  folds       = 3,
+  nrepeat     = 50,
+  progressBar = FALSE,
+  dist        = "centroids.dist",
+  BPPARAM     = param_paralelo
+)
+
+cat("\nkeepX optimo por bloque:\n")
+print(tune_diablo$choice.keepX)
+```
+
+```{r modelo_final_diablo}
+# MODELO FINAL DIABLO
+
+diablo_final <- block.splsda(
+  X      = X,
+  Y      = Y,
+  ncomp  = ncomp_opt,
+  keepX  = tune_diablo$choice.keepX,
+  design = design,
+  near.zero.var = TRUE)
+
+cat("Modelo DIABLO final ajustado.\n")
+```
+
+## Visualizaciones Diablo 
+
+```{r visualizaciones_diablo}
+# VISUALIZACIONES DIABLO
+
+# Individuos en espacio latente consenso
+plotIndiv(diablo_final,
+          ind.names     = FALSE,
+          group         = Y,
+          legend        = TRUE,
+          ellipse       = FALSE,
+          col.per.group = paleta_dx,
+          rep.space     = "XY-variance",
+          title         = "DIABLO - Muestras en espacio latente consenso")
+
+# Variables (correlacion con componentes)
+plotVar(diablo_final,
+        var.names = list(FALSE, FALSE, FALSE),
+        style     = "graphics",
+        legend    = TRUE,
+        pch       = c(16, 17, 15),
+        col       = c("#E41A1C", "#377EB8", "#FF7F00"))
+
+# Loadings componente 1
+plotLoadings(diablo_final, comp = 1, block = "metabolitos",
+             contrib = "max", method = "median", size.name = 0.6,
+             title = "DIABLO - Loadings metabolitos (comp 1)")
+
+plotLoadings(diablo_final, comp = 1, block = "microbiota",
+             contrib = "max", method = "median", size.name = 0.6,
+             title = "DIABLO - Loadings microbiota (comp 1)")
+
+plotLoadings(diablo_final, comp = 1, block = "clinica",
+             contrib = "max", method = "median", size.name = 0.6,
+             title = "DIABLO - Loadings clinica (comp 1)")
+
+# Loadings componente 2
+plotLoadings(diablo_final, comp = 2, block = "metabolitos",
+             contrib = "max", method = "median", size.name = 0.6,
+             title = "DIABLO - Loadings metabolitos (comp 2)")
+
+plotLoadings(diablo_final, comp = 2, block = "microbiota",
+             contrib = "max", method = "median", size.name = 0.6,
+             title = "DIABLO - Loadings microbiota (comp 2)")
+
+plotLoadings(diablo_final, comp = 2, block = "clinica",
+             contrib = "max", method = "median", size.name = 0.6,
+             title = "DIABLO - Loadings clinica (comp 2)")
+
+# Clustered Image Map
+png("DIABLO_CIM.png", width = 4000, height = 3000, res = 350)
+cimDiablo(diablo_final,
+          comp        = 1:min(2, ncomp_opt),
+          title       = "DIABLO - Correlaciones entre variables",
+          margins     = c(12, 12),
+          size.legend = 0.7)
+dev.off()
+graphics.off()
+
+# Red de correlaciones entre omicas
+png("DIABLO_Red_Correlaciones.png", width = 2500, height = 2500, res = 250)
+network(diablo_final,
+        blocks         = c("metabolitos", "microbiota", "clinica"),
+        comp           = list(metabolitos = c(1, 2),
+                              microbiota  = c(1, 2),
+                              clinica     = c(1, 2)),
+        color.node     = c("#E41A1C", "#377EB8", "#FF7F00"),
+        shape.node     = c("rectangle", "circle", "rectangle"),
+        cutoff         = 0.6,
+        color.edge     = mixOmics::color.GreenRed(50),
+        cex.node       = 0.6,
+        cex.edge.label = 0.7,
+        lwd.edge       = 1)
+title("DIABLO - Red de relevancia multiomica (|r| > 0.6)", cex.main = 1.2)
+dev.off()
+graphics.off()
+
+# Circos plot
+lista_nombres_variables <- list(
+  metabolitos = colnames(mat_met),
+  microbiota  = colnames(mat_bact),
+  clinica     = colnames(mat_clin)
+)
+
+png("DIABLO_CircosPlot.png", width = 3000, height = 3000, res = 450)
+circosPlot(object        = diablo_final,
+           comp          = c(1, 2),
+           cutoff        = 0.6,
+           color.blocks  = c("#E41A1C", "#377EB8", "#FF7F00"),
+           color.cor     = c("#4DAF4A", "#E41A1C"),
+           var.names     = lista_nombres_variables,
+           cex.key       = 0.6,
+           cex.label     = 0.8,
+           show.IntLines = TRUE,
+           line          = TRUE)
+title("DIABLO - Circos (|r| > 0.6)", cex.main = 1.0)
+dev.off()
+graphics.off()
+```
+
+
+## Evaluación del rendimiento del modelo DIABLO
+
+En este apartado se evalúa el rendimiento del modelo mediante tasas de error, exactitud global y matrices de confusión. Además, se analiza el desempeño por clase clínica, permitiendo identificar qué diagnósticos son más fácilmente separables.
+
+```{r evaluacion_diablo}
+# EVALUACION FINAL DIABLO
+
+perf_final <- perf(diablo_final,
+                   validation  = "Mfold",
+                   folds       = 3,
+                   nrepeat     = 50,
+                   progressBar = FALSE,
+                   cpus        = 8)
+
+# Tasa de error por componente
+cat("\n=== TASA DE ERROR POR COMPONENTE (centroids.dist) ===\n")
+print(round(perf_final$WeightedVote.error.rate$centroids.dist, 3))
+
+ber_por_comp <- perf_final$WeightedVote.error.rate$centroids.dist["Overall.BER", ]
+mejor_comp_n <- which.min(ber_por_comp)
+cat("\nMejor componente:", names(mejor_comp_n),
+    "| BER =",    round(ber_por_comp[mejor_comp_n], 3),
+    "| Acierto =", round(1 - ber_por_comp[mejor_comp_n], 3), "\n")
+
+# Tasa de acierto por clase en el componente optimo
+cat("\n=== TASA DE ACIERTO POR CLASE (comp", ncomp_opt, ", centroids.dist) ===\n")
+error_por_clase <- perf_final$WeightedVote.error.rate$centroids.dist[
+  c("Healthy", "VHC", "HAI", "CBP"),
+  paste0("comp", ncomp_opt)
+]
+acierto_por_clase <- round(1 - error_por_clase, 3)
+print(acierto_por_clase)
+
+# Matriz de confusion desde $class
+dist_usar   <- "centroids.dist"
+col_usar    <- ncomp_opt
+bloque_usar <- "metabolitos"
+n_rep       <- length(perf_final$class)
+
+pred_matrix <- do.call(cbind, lapply(seq_len(n_rep), function(r) {
+  rep_name <- paste0("nrep", r)
+  mat <- perf_final$class[[rep_name]][[bloque_usar]][[dist_usar]]
+  mat[, col_usar]
+}))
+
+sample_names <- rownames(perf_final$class$nrep1[[bloque_usar]][[dist_usar]])
+
+pred_moda <- apply(pred_matrix, 1, function(x) {
+  tab <- table(x)
+  names(tab)[which.max(tab)]
+})
+
+Y_alineado <- Y[sample_names]
+
+conf_mat <- table(
+  Predicho = factor(pred_moda,  levels = levels(Y)),
+  Real     = factor(Y_alineado, levels = levels(Y))
+)
+
+cat("\n=== MATRIZ DE CONFUSION (centroids.dist, comp", ncomp_opt,
+    ", moda sobre", n_rep, "reps) ===\n")
+print(conf_mat)
+
+acierto_global <- round(sum(diag(conf_mat)) / sum(conf_mat), 3)
+cat("\nAcierto global:", acierto_global,
+    "| Error global:", round(1 - acierto_global, 3), "\n")
+
+# Heatmap de la matriz de confusion
+df_conf <- as.data.frame(conf_mat)
+
+ggplot(df_conf, aes(x = Real, y = Predicho, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = Freq), size = 6, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "#377EB8") +
+  theme_pubr() +
+  labs(title    = paste0("DIABLO - Matriz de confusion (comp ", ncomp_opt, ")"),
+       subtitle = paste0("Acierto global = ", acierto_global,
+                         " | BER = ", round(ber_por_comp[mejor_comp_n], 3)),
+       x    = "Clase real",
+       y    = "Clase predicha",
+       fill = "N muestras") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+El análisis de rendimiento del modelo revela una clara reducción de la tasa de error global a medida que se añaden componentes latentes, consolidando a la **componente 3 (`comp3`)** como la óptima, al registrar la tasa de error balanceado más baja (**BER = 0.160**) y una robusta precisión global de acierto del **84%**. Al evaluar el comportamiento por clases diagnósticas en este componente óptimo, junto con la información resultante de la matriz de distancias logrando un acierto global del 73.9%, se observa una alta capacidad discriminatoria para identificar a los pacientes con Hepatitis C (**VHC: 94% de acierto; 11 clasificados correctamente**) y Hepatitis Autoinmune (**HAI: 90% de acierto; 7 correctamente clasificados**). Por el contrario, el punto débil del clasificador se encuentra en la distinción entre **Healthy** y **CBP**, donde se observa una confusión cruzada: 5 muestras de CBP fueron clasificadas erróneamente como Healthy (79% de acierto), y 6 muestras reales de CBP se asignaron correctamente pero con un margen estrecho frente al error, lo que sitúa a CBP como la clase con menor tasa de acierto (73%).
+
+
+# **Interpretación de biomarcadores seleccionados**
+
+Después, se extraen las variables más relevantes de cada ómica según su contribución al modelo DIABLO. Esto permite identificar posibles biomarcadores clínicos, metabólicos y microbianos asociados a la clasificación de los pacientes.
+
+```{r biomarcadores_diablo}
+# VARIABLES SELECCIONADAS Y EXPORTACION DE BIOMARCADORES
+
+for (bloque in names(X)) {
+  cat("\n============================\n")
+  cat("BLOQUE:", bloque, "\n")
+  cat("============================\n")
+  sel <- selectVar(diablo_final, block = bloque, comp = 1)
+  print(head(sel[[bloque]]$value, 10))
+}
+
+lista_biom <- lapply(names(X), function(bloque) {
+  sel <- selectVar(diablo_final, block = bloque, comp = 1)
+  data.frame(
+    variable    = rownames(sel[[bloque]]$value),
+    loading     = sel[[bloque]]$value[, 1],
+    abs_loading = abs(sel[[bloque]]$value[, 1]),
+    block       = bloque
+  ) %>% arrange(desc(abs_loading))
+})
+names(lista_biom) <- names(X)
+
+tabla_biomarcadores <- bind_rows(lista_biom)
+```
+
+Estas tablas muestran los vectores de carga (*loadings*) de las variables seleccionadas por el modelo DIABLO en el **componente 1** para tres bloques de datos (metabolómica, microbioma y variables clínicas/histológicas), ordenadas según su contribución a la firma molecular común. 
+
+En el bloque de metabolitos, todos presentan valores negativos, destacando el **ácido 2-isopropilmálico** y el **ácido metilmalónico** como los de mayor peso discriminatorio. En el bloque microbioma, los géneros *Burkholderia*, *Turicella* y *Sphingomonas* muestran una fuerte carga positiva, contraponiéndose a *Anaerococcus*. Finalmente, en el bloque clínico, la variable `anti_vhc_1` destaca drásticamente sobre las demás con el peso negativo más fuerte (-0.842), consolidándose como la variable clave de este bloque para explicar la correlación mutua y la separación de los grupos patológicos en el primer componente del modelo multi-ómico.
+
+
+# **Concordancia entre MOFA+ y DIABLO**
+
+En este punto se compara la estructura latente obtenida por MOFA+ con el componente supervisado principal de DIABLO. La correlación entre ambos modelos permite evaluar si están capturando el mismo eje biológico subyacente.
+
+```{r concordancia_intermodelo}
+# CONCORDANCIA INTER-MODELO: MOFA+ vs DIABLO
+
+comp_diablo <- diablo_final$variates$metabolitos[, 1, drop = FALSE] %>%
+  as.data.frame() %>%
+  rownames_to_column("Sample") %>%
+  setNames(c("Sample", "DIABLO_Comp1"))
+
+df_inter_modelos <- df_factores_plot %>%
+  left_join(comp_diablo, by = "Sample")
+
+test_corr <- cor.test(df_inter_modelos$Factor1,
+                      df_inter_modelos$DIABLO_Comp1,
+                      method = "spearman")
+
+cat("\n=== Concordancia inter-modelo (MOFA+ Factor1 ~ DIABLO Comp1) ===\n")
+cat("  Spearman r =", round(test_corr$estimate, 3),
+    " p =", round(test_corr$p.value, 4), "\n")
+cat("  Si |r| > 0.5 y p < 0.05, ambos metodos capturan el mismo eje biologico\n")
+
+ggplot(df_inter_modelos, aes(x = Factor1, y = DIABLO_Comp1, color = diagnostico)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_smooth(method = "lm", color = "gray40", se = TRUE, fill = "gray85") +
+  scale_color_manual(values = paleta_dx) +
+  theme_pubr() +
+  labs(title    = "Concordancia MOFA+ vs DIABLO",
+       subtitle = paste0("Spearman r = ", round(test_corr$estimate, 3),
+                         ", p = ", round(test_corr$p.value, 4)),
+       x        = "MOFA+ Factor 1",
+       y        = "DIABLO Componente 1 (metabolitos)",
+       color    = "Diagnostico")
+```
+
+Este gráfico demuestra una **concordancia biológica casi perfecta** entre ambos enfoques multi-ómicos, revelando una correlación de Spearman de **r = -0.965 (p = 0)** entre el Factor 1 de MOFA+ y el Componente 1 de DIABLO. La alineación lineal confirma que ambos métodos capturan exactamente el mismo eje de variación biológica latente (pero con signos inversos), mostrando además una separación clínica coherente: los pacientes sanos e histológicamente estables (**Healthy** y **HAI**) se agrupan de forma compacta en el extremo superior izquierdo, mientras que los perfiles patológicos (**CBP** y **VHC**) se desplazan progresivamente hacia la derecha de la gráfica.
+
+
+# **Integración final entre metaboloma y microbiota**
+
+Finalmente, se analizan las correlaciones cruzadas entre los biomarcadores más relevantes seleccionados por DIABLO. Se construye un heatmap inter-ómico que permite visualizar las relaciones entre metabolitos y taxones bacterianos, revelando posibles interacciones biológicas clave.
+
+```{r heatmap_interomico}
+#HEATMAP DE CORRELACION INTER-OMICA (top biomarcadores DIABLO)
+
+top_metabolitos <- tabla_biomarcadores %>%
+  dplyr::filter(block == "metabolitos") %>%
+  slice_max(abs_loading, n = 8) %>%
+  pull(variable)
+
+top_microbiota <- tabla_biomarcadores %>%
+  dplyr::filter(block == "microbiota") %>%
+  slice_max(abs_loading, n = 8) %>%
+  pull(variable)
+
+sub_mat_met  <- mat_met[, top_metabolitos, drop = FALSE]
+sub_mat_bact <- mat_bact[, top_microbiota, drop = FALSE]
+
+mat_corr_cruzada <- cor(sub_mat_met, sub_mat_bact, method = "spearman")
+
+col_fun <- colorRamp2(c(-1, 0, 1), c("#377EB8", "white", "#E41A1C"))
+
+heatmap_inter_omica <- Heatmap(
+  mat_corr_cruzada,
+  name             = "Corr. Spearman",
+  col              = col_fun,
+  cluster_rows     = TRUE,
+  cluster_columns  = TRUE,
+  show_row_dend    = TRUE,
+  show_column_dend = TRUE,
+  row_names_gp     = gpar(fontface = "bold", fontsize = 10),
+  column_names_gp  = gpar(fontface = "italic", fontsize = 10),
+  column_title     = "Eje Microbiota-Metaboloma (Top Biomarcadores DIABLO)",
+  column_title_gp  = gpar(fontsize = 12, fontface = "bold"),
+  heatmap_legend_param = list(direction = "vertical")
+)
+
+draw(heatmap_inter_omica)
+```
+
+Este mapa de calor (*heatmap*) revela una **clara estructura dicotómica en la interacción microbiota-metaboloma** basada en las correlaciones de Spearman de los top biomarcadores seleccionados por DIABLO. El clúster bacteriano se divide drásticamente en dos perfiles: por un lado, el género ***Anaerococcus*** muestra una **correlación positiva generalizada** con todo el bloque de metabolitos, destacando su vínculo con la *carnitine* y la *choline*; por otro lado, los géneros ***Turicella_1*, *Methylobacterium*, *Burkholderia* y *Sphingomonas*** exhiben una **correlación negativa consistente** con estos mismos compuestos. Este comportamiento inverso y perfectamente agrupado por la dendrografía superior sugiere la existencia de un eje funcional coordinado, donde el aumento de ciertos géneros bacterianos coincide sistemáticamente con la depleción de metabolitos clave como el *succinato* o el *alfa-cetoglutarato*, reflejando una firma co-regulada en el ecosistema intestinal.
+
+

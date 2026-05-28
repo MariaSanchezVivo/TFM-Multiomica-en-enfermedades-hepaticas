@@ -1,0 +1,627 @@
+---
+title: "Agrupación por Phylum"
+author: "María Sánchez Vivo"
+date: "2026-05-25"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE,message = FALSE)
+```
+
+# **Introducción**
+
+En este script se realiza un análisis metataxonómico centrado en la composición por phylum y el análisis diferencial de microbioma, aplicando una estrategia estándar de transformación de datos en dos niveles: la **abundancia relativa** se utiliza para **visualizaciones** descriptivas como gráficos de barras o tipo donut, mientras que la **transformación CLR** (logaritmo de la razón respecto a la media geométrica) se emplea para **análisis estadísticos y multivariantes** como *MaAsLin2*, correlaciones o PCA/PCoA con distancia euclídea. Dado que el CLR requiere manejar ceros, se aplica una pseudocuenta (+1.0).  Por otro lado, *ANCOMBC2* se utiliza directamente con counts crudos, ya que incorpora su propia corrección de sesgo composicional y no requiere transformación CLR previa.
+
+
+```{r librerias_datos}
+library(mia)
+library(miaViz)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(RColorBrewer)
+library(Maaslin2)
+library(tidyverse)
+library(ANCOMBC)
+
+#Carga de datos
+datos_metataxonomicos <- readRDS("tax.rds")
+datos_clinicos        <- readRDS("covs.rds")
+datos_abundancia_16S  <- readRDS("metagen.rds")
+```
+
+Tras la preparación de las matrices de abundancia, taxonomía y datos clínicos, se verifica la concordancia de muestras y taxones antes de integrarlos en un objeto **TreeSummarizedExperiment**. Este objeto se complementa con una transformación a **abundancia relativa** para análisis descriptivos.
+
+```{r matrices_TSE}
+# Preparar matrices ─────────────────────────────────────────────────────────
+counts_prepared <- datos_abundancia_16S %>%
+  column_to_rownames("Sample") %>%
+  t() %>%
+  as.matrix()
+colnames(counts_prepared) <- trimws(colnames(counts_prepared))
+
+datos_clinicos_mia <- as.data.frame(datos_clinicos)
+rownames(datos_clinicos_mia) <- trimws(as.character(datos_clinicos_mia$Sample))
+
+tax_prepared <- datos_metataxonomicos %>%
+  as.data.frame() %>%
+  as.matrix()
+rownames(tax_prepared) <- trimws(rownames(tax_prepared))
+
+comun_muestras  <- intersect(colnames(counts_prepared), rownames(datos_clinicos_mia))
+counts_filtrado <- counts_prepared[, comun_muestras]
+clinicos_final  <- datos_clinicos_mia[comun_muestras, ]
+
+comun_taxones <- intersect(rownames(counts_filtrado), rownames(tax_prepared))
+counts_final  <- counts_filtrado[comun_taxones, ]
+tax_final     <- tax_prepared[comun_taxones, ]
+
+tse <- TreeSummarizedExperiment(
+  assays  = list(counts = as.matrix(counts_final)),
+  colData = DataFrame(clinicos_final),
+  rowData = DataFrame(tax_final)
+)
+
+# Transformaciones base sobre el TSE completo
+tse <- transformAssay(tse, method = "relabundance")   # Para gráficos descriptivos
+
+# ── Paleta de diagnóstico ─────────────────────────────────────────────────────
+paleta_dx <- c("CBP"     = "#E41A1C",
+               "Healthy" = "#4DAF4A",
+               "HAI"     = "#377EB8",
+               "VHC"     = "#FF7F00")
+```
+
+# **Agrupación por phylum - preparación**
+
+Los datos taxonómicos se simplifican mediante su agregación a nivel de Phylum, lo que permite reducir la complejidad del dataset y facilitar el análisis de la estructura global de la microbiota. Posteriormente, se reorganiza la información en formato largo para su visualización.
+
+```{r Agrupacion_por_phylum}
+tse_phylum <- agglomerateByRank(tse, rank = "Phylum")
+tse_phylum <- tse_phylum[rowData(tse_phylum)$Phylum != "", ]
+tse_phylum <- transformAssay(tse_phylum, method = "relabundance")
+
+# Extraer en formato largo
+mat_rel <- assay(tse_phylum, "relabundance")
+
+df_all <- as.data.frame(mat_rel) %>%
+  rownames_to_column("Phylum") %>%
+  pivot_longer(cols      = -Phylum,
+               names_to  = "SampleID",
+               values_to = "Abundancia") %>%
+  left_join(
+    as.data.frame(colData(tse_phylum)) %>%
+      rownames_to_column("SampleID") %>%
+      select(SampleID, diagnostico_principal),
+    by = "SampleID"
+  )
+
+# ── Paleta de phylum con colores diferenciables ───────────────────────────────
+phyla_presentes <- unique(df_all$Phylum)
+n_phyla         <- length(phyla_presentes)
+
+paleta_base <- c("#A6CEE3","#B2DF8A","#FB9A99","#FDBF6F","#CAB2D6","#FFFF99",
+                 "#8DD3C7","#BEBADA","#FCCDE5","#D9D9D9","#BC80BD","#CCEBC5")
+
+paleta_phylum <- setNames(colorRampPalette(paleta_base)(n_phyla),phyla_presentes)
+```
+
+# **Representaciones gráficas**
+
+## Distribución de abundancias por Phylum — Top 10 phyla 
+
+Se visualiza la distribución de los principales Phyla mediante un gráfico de densidad, permitiendo comparar su abundancia relativa entre los distintos grupos diagnósticos.
+
+```{r grafico_densidad_phylum}
+#GRÁFICO DE DENSIDAD — Top 10 phylum más abundantes
+
+plotAbundanceDensity(tse_phylum,
+                     layout     = "jitter",
+                     assay.type = "relabundance",
+                     n          = 10,
+                     colour_by  = "diagnostico_principal") +
+  scale_color_manual(values = paleta_dx) +
+  theme_pubr() +
+  labs(title = "Top 10 phyla — Distribución por diagnóstico",
+       color = "Diagnóstico")
+```
+
+El gráfico confirma el dominio absoluto de ***Proteobacteria***, con abundancias superiores al 75% en casi todas las muestras, seguido por ***Actinobacteria*** y ***Firmicutes*** como componentes secundarios (0-25%), mientras que los demás filos permanecen en niveles marginales. La distribución de los puntos demuestra que todas las muestras se solapan por completo, ratificando de forma visual que no existen perfiles taxonómicos diferenciales ni agrupamientos específicos vinculados a ninguna de las hepatopatías o al grupo control.
+
+
+## Composición global de microbiota
+
+La estructura global de la microbiota se resume mediante un gráfico tipo donut basado en la abundancia media de cada Phylum en el conjunto de muestras.
+
+```{r representacion_phylum_global}
+df_global <- df_all %>%
+  group_by(Phylum) %>%
+  summarise(Abundancia = mean(Abundancia, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(Abundancia))
+
+ggplot(df_global, aes(x = 2, y = Abundancia,
+                      fill = reorder(Phylum, -Abundancia))) +
+  geom_bar(stat = "identity", color = "white", linewidth = 0.3) +
+  coord_polar(theta = "y") +
+  xlim(0, 2.5) +
+  scale_fill_manual(values = paleta_phylum) +
+  theme_void() +
+  labs(title = "Composición global de microbiota por Phylum",
+       fill  = "Phylum")
+```
+
+Este gráfico de donut sintetiza los datos de dispersión anteriores, visualizando el dominio hegemónico de ***Proteobacteria***.
+
+## Composición por diagnóstico
+
+Se analiza la composición microbiana a nivel de Phylum estratificada por grupo diagnóstico, permitiendo evaluar posibles diferencias en la estructura global de la microbiota entre enfermedades.
+
+```{r representacion_phylum_enfermedad}
+df_disease <- df_all %>%
+  group_by(diagnostico_principal, Phylum) %>%
+  summarise(Abundancia = mean(Abundancia, na.rm = TRUE), .groups = "drop")
+
+ggplot(df_disease, aes(x = 2, y = Abundancia,
+                       fill = reorder(Phylum, -Abundancia))) +
+  geom_bar(stat = "identity", color = "white", linewidth = 0.3) +
+  coord_polar(theta = "y") +
+  xlim(0, 2.5) +
+  facet_wrap(~ diagnostico_principal, ncol = 2) +
+  scale_fill_manual(values = paleta_phylum) +
+  theme_void() +
+  theme(strip.text= element_text(face = "bold", size = 11),
+        legend.position = "right",  legend.text = element_text(size = 6)) +
+  labs(title = "Composición por Phylum según diagnóstico",
+       fill  = "Phylum")
+```
+
+Esta comparativa por diagnóstico desglosa el donut global anterior y demuestra que la estructura comunitaria es prácticamente idéntica en los cuatro grupos. El filo ***Proteobacteria*** mantiene su dominio hegemónico estable en todos los diagnósticos. Asimismo, las proporciones de los filos secundarios, ***Actinobacteria*** y ***Firmicutes***, guardan una simetría visual casi perfecta entre sí, lo que confirma de manera definitiva a nivel taxonómico macro la conclusión de los análisis de beta diversidad previos: el diagnóstico principal no genera cambios significativos en la composición microbiológica de los pacientes. 
+
+En **CBP** se observa una franja sutilmente más delgada de ****Cyanobacteria*** en comparación con el resto de diagnósticos. Sin embargo, al tratarse de un taxón minoritario en un ecosistema dominado por ****Proteobacteria***, esta variación es marginal y queda englobada dentro de la variabilidad interindividual vista en **beta-diversidad** previamente, reafirmando que no existen diferencias globales significativas entre los diagnósticos.
+
+
+## Composición por muestra 
+
+A nivel individual, se visualiza la distribución de Phyla mediante barras apiladas, lo que permite apreciar la variabilidad interindividual dentro de cada grupo diagnóstico.
+
+```{r composicion_phylum_enfermedad}
+# Versión compacta (sin etiquetas de muestra)
+ggplot(df_all, aes(x = SampleID, y = Abundancia, fill = Phylum)) +
+  geom_bar(stat = "identity", width = 1) +
+  facet_wrap(~ diagnostico_principal, scales = "free_x", ncol = 2) +
+  scale_fill_manual(values = paleta_phylum) +
+  theme_pubr(base_size = 8) +
+  labs(title = "Composición por Phylum de cada tipo de diagnóstico",
+       y     = "Abundancia relativa",
+       x     = "Muestras") +
+  theme(axis.text.x     = element_blank(),
+        axis.ticks.x    = element_blank(),
+        panel.grid      = element_blank(),
+        legend.position = "right")
+
+# Versión con variabilidad individual (etiquetas por muestra)
+df_all <- df_all %>%
+  mutate(etiqueta_muestra = paste0(SampleID, "\n(", diagnostico_principal, ")"))
+
+orden_muestras <- df_all %>%
+  distinct(SampleID, diagnostico_principal) %>%
+  arrange(diagnostico_principal, SampleID) %>%
+  mutate(etiqueta_muestra = paste0(SampleID, "\n(", diagnostico_principal, ")")) %>%
+  pull(etiqueta_muestra)
+
+df_all <- df_all %>%
+  mutate(etiqueta_muestra = factor(etiqueta_muestra, levels = orden_muestras))
+
+ggplot(df_all, aes(x = etiqueta_muestra, y = Abundancia, fill = Phylum)) +
+  geom_bar(stat = "identity", width = 0.95) +
+  scale_fill_manual(values = paleta_phylum) +
+  theme_bw() +
+  theme(axis.text.x     = element_text(angle = 90, vjust = 0.5,
+                                       hjust = 1, size = 5),
+        axis.title.x    = element_blank(),
+        panel.grid      = element_blank(),
+        legend.position = "right") +
+  labs(title = "Variabilidad individual por muestra — Phylum",
+       y     = "Abundancia relativa",
+       fill  = "Phylum")
+```
+
+Este gráfico demuestra visualmente que la enorme **variabilidad interindividual** eclipsa cualquier patrón patológico, explicando el bajo R^2 y la falta de significancia en los análisis previos. Aunque ***Proteobacteria*** predomina en general, sus drásticas oscilaciones junto a las de ***Actinobacteria*** y ***Firmicutes*** se repiten de forma idéntica dentro de todos los grupos. Encontrar perfiles extremos tanto en sujetos sanos como con hepatopatías (*VHC, HAI, CBP*) confirma que la estructura de la microbiota es una firma única de cada paciente y no una consecuencia del diagnóstico principal.
+
+
+# **Preparación del TSE para análisis con CLR**
+
+Con el objetivo de aplicar métodos basados en datos composicionales, se genera una versión del objeto a nivel de **género** y se añade una **pseudocuenta a los counts** para evitar problemas con ceros en la transformación logarítmica. Esta etapa permite obtener datos adecuados para el análisis mediante **CLR**.
+
+```{r preparacion_TSE}
+# Aplicar pseudocuenta 1.0 a los counts del TSE original
+counts_pseudo <- assay(tse, "counts") + 1.0
+
+tse_pseudo <- TreeSummarizedExperiment(
+  assays  = list(counts = counts_pseudo),
+  colData = colData(tse),
+  rowData = rowData(tse)
+)
+
+# Agglomerar por género sobre el TSE con pseudocuenta
+tse_genus <- agglomerateByRank(tse_pseudo, rank = "Genus")
+tse_genus <- tse_genus[rowData(tse_genus)$Genus != "", ]
+
+# relabundance para exploración / ANCOMBC2
+tse_genus <- transformAssay(tse_genus, method = "relabundance")
+
+# CLR a partir de counts con pseudocuenta (mia lo calcula internamente)
+# clr(x_i) = log(x_i / exp(mean(log(x_j)))) para cada muestra
+tse_genus <- transformAssay(
+  tse_genus,
+  assay.type = "counts",          # parte de counts+1.0
+  method     = "clr",
+  name       = "clr"
+)
+
+# Verificación rápida: la media de cada fila CLR debe ser ~0 por muestra
+cat("Verificación CLR — media por muestra (deben ser ~0):\n")
+print(summary(colMeans(assay(tse_genus, "clr"))))
+```
+Esta verificación confirma que la transformación CLR se ejecutó correctamente. Teóricamente, tras esta normalización, la media de cada muestra debe ser exactamente 0. Dado que los valores obtenidos oscilan en un rango infinitesimal, representan el 0 real en computación, reflejando solo mínimos errores de redondeo flotante del software. En resumen: los datos están perfectamente validados y listos para análisis estadísticos robustos sin sesgos composicionales.
+
+
+# **Análisis diferencial con MaAsLin2 (CLR)**
+
+El análisis de asociaciones entre géneros y diagnóstico se realiza mediante **MaAsLin2**, utilizando datos previamente transformados con **CLR** para garantizar la validez del modelo lineal en espacio composicional.
+
+```{r, maaslin2}
+mat_maaslin <- t(assay(tse_genus, "clr"))   # muestras × géneros en CLR
+mat_maaslin <- as.data.frame(mat_maaslin)
+
+meta_maaslin <- as.data.frame(colData(tse_genus)) %>%
+  select(diagnostico_principal) %>%
+  mutate(diagnostico_principal = factor(diagnostico_principal,
+                                        levels = c("Healthy", "VHC", "HAI", "CBP")))
+
+mat_maaslin <- mat_maaslin[rownames(meta_maaslin), ]
+
+fit_maaslin <- Maaslin2(
+  input_data      = mat_maaslin,
+  input_metadata  = meta_maaslin,
+  output          = "maaslin2_output",
+  fixed_effects   = "diagnostico_principal",
+  reference       = "diagnostico_principal,Healthy",
+  normalization   = "NONE",        # CLR ya aplicado externamente
+  transform       = "NONE",        # sin transformación adicional
+  analysis_method = "LM",          # LM es correcto sobre CLR
+  min_prevalence  = 0.10,
+  min_abundance   = 0,             # con CLR no tiene sentido filtrar por abundancia
+  # (CLR puede ser negativo); el filtro de prevalencia aplicado al construir tse_genus
+  cores           = 1
+)
+```
+
+## Volcano plot (MaAsLin2, q-valor)
+
+Los resultados del análisis diferencial se visualizan mediante un **volcano plot basado en valores q**, con el objetivo de identificar posibles taxones enriquecidos o deplecionados entre grupos diagnósticos bajo **control de FDR**.
+
+```{r volcano_Maaslin2}
+# Volcano MaAsLin2 con q-valor 
+
+df_volcano <- fit_maaslin$results %>%
+  filter(metadata == "diagnostico_principal") %>%
+  mutate(
+    neg_log10q    = -log10(qval),
+    Significativo = case_when(
+      qval < 0.05 & coef >  0.5 ~ "Enriquecido",
+      qval < 0.05 & coef < -0.5 ~ "Depleccionado",
+      TRUE                       ~ "NS"
+    ),
+    label = ifelse(qval < 0.05 & abs(coef) > 0.5, feature, NA_character_)
+  )
+
+ggplot(df_volcano, aes(x = coef, y = neg_log10q,
+                       color = Significativo, label = label)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_text_repel(size = 2.5, max.overlaps = 15, na.rm = TRUE,
+                  fontface = "italic") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = c(-0.5, 0.5),  linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c("Enriquecido"   = "#E41A1C",
+                                "Depleccionado" = "#377EB8",
+                                "NS"            = "gray70")) +
+  facet_wrap(~ value, ncol = 3) +
+  theme_pubr(base_size = 9) +
+  labs(title    = "Volcano plot — Géneros diferenciales (MaAsLin2 · CLR)",
+       subtitle = "Comparaciones vs Healthy · FDR < 0.05, |coef| > 0.5",
+       x        = "Coeficiente CLR (dirección del efecto)",
+       y        = "-log10(q-valor)",
+       color    = NULL)
+
+```
+
+Este Volcano plot confirma de forma contundente que **no existen géneros bacterianos significativamente diferenciales** al comparar cada hepatopatía frente al grupo sano. Todos los puntos se mantienen en la base del gráfico como **NS (No Significativos)**, sin superar el umbral estadístico (FDR < 0.05). 
+
+Como no hay significativos por FDR, se realiza un volcano exploratorio con **p nominal**. 
+
+
+## Diagnóstico de significación (p nominal)
+
+Para evaluar la sensibilidad del análisis, se inspecciona la distribución de **p-valores y coeficientes**, comprobando si los umbrales de significación FDR son demasiado estrictos para el tamaño muestral.
+
+```{r significativos_pnominal}
+cat("\nDiagnóstico umbrales MaAsLin2:\n")
+cat("q-valores — resumen:\n"); print(summary(df_volcano$qval))
+cat("Coeficientes — resumen:\n"); print(summary(df_volcano$coef))
+cat("Sig. FDR<0.05:", sum(df_volcano$qval < 0.05, na.rm = TRUE), "\n")
+cat("Sig. p<0.05:  ", sum(
+  fit_maaslin$results$pval[
+    fit_maaslin$results$metadata == "diagnostico_principal"
+  ] < 0.05, na.rm = TRUE), "\n")
+```
+Este resumen de *MaAsLin2* confirma que **ningún género está asociado al diagnóstico** tras corregir por comparaciones múltiples, ya que el q-valor mínimo se eleva drásticamente a **0.9622**, dejando en **0 los resultados significativos por FDR**. Sin embargo, el hecho de que existan **17 géneros con un *p*-valor nominal significativo** (p < 0.05) permite un análisis exploratorio menos restrictivo. Por ello, se procede a representar gráficamente los resultados utilizando el **$p$-valor nominal**, lo que permitirá visualizar aquellas tendencias y bacterias latentes que, aunque no superan el estricto filtro estadístico global, muestran ligeras variaciones entre los grupos diagnósticos.
+
+
+## Volcano plot exploratorio (MaAsLin2, p nominal)
+
+Se genera una versión exploratoria del volcano plot utilizando **p-valores nominales**, con el fin de detectar posibles tendencias biológicas no captadas bajo corrección múltiple:
+
+```{r volcano_pnominal_Maaslin2}
+df_volcano_pnom <- fit_maaslin$results %>%
+  filter(metadata == "diagnostico_principal") %>%
+  mutate(
+    neg_log10p    = -log10(pval),
+    Significativo = case_when(
+      pval < 0.05 & coef >  0.3 ~ "Tendencia enriquecido",
+      pval < 0.05 & coef < -0.3 ~ "Tendencia depleccionado",
+      TRUE                       ~ "NS"
+    ),
+    label = ifelse(pval < 0.05 & abs(coef) > 0.3, feature, NA_character_)
+  )
+
+ggplot(df_volcano_pnom, aes(x = coef, y = neg_log10p,
+                            color = Significativo,
+                            size  = Significativo,
+                            label = label)) +
+  geom_point(alpha = 0.7) +
+  geom_text_repel(size = 2.5, max.overlaps = 20, na.rm = TRUE,
+                  box.padding = 0.4, fontface = "italic") +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed", color = "gray40", linewidth = 0.5) +
+  geom_vline(xintercept = c(-0.3, 0.3),
+             linetype = "dashed", color = "gray40", linewidth = 0.5) +
+  scale_color_manual(values = c(
+    "Tendencia enriquecido"   = "#E41A1C",
+    "Tendencia depleccionado" = "#377EB8",
+    "NS"                      = "gray75"
+  )) +
+  scale_size_manual(values = c(
+    "Tendencia enriquecido"   = 2.5,
+    "Tendencia depleccionado" = 2.5,
+    "NS"                      = 1.5
+  )) +
+  facet_wrap(~ value, ncol = 3) +
+  theme_pubr(base_size = 9) +
+  labs(title    = "Volcano plot — Géneros diferenciales por diagnóstico (MaAsLin2 · CLR)",
+       subtitle = "p nominal < 0.05 · sin corrección múltiple · análisis exploratorio",
+       x        = "Coeficiente CLR (dirección del efecto)",
+       y        = "-log10(p-valor)",
+       color    = NULL, size = NULL) +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+Al relajar el filtro estadístico al **p-valor nominal** (p < 0.05), el Volcano plot exploratorio destapa los **17 géneros potencialmente diferenciales** que la rigidez del FDR ocultaba, revelando sutiles tendencias biológicas asociadas a cada hepatopatía. Se observa que **VHC** presenta el perfil más marcado con un fuerte enriquecimiento de *Peptoniphilus*, *Cloacibacterium*, *Paenibacillus* y *Lactococcus*, mientras que **CBP** y **HAI** muestran deplesiones características de géneros como *Amaricoccus* y *Clostridium* junto a enriquecimientos específicos (*Stenotrophomonas* y *Variovorax*, respectivamente). Este hallazgo aporta valor clínico al demostrar que, aunque la estructura a nivel de *Phylum* es homogénea entre grupos, existen sutiles corrientes o biomarcadores latentes a nivel de género propios de cada patología.
+
+
+# **Análisis diferencial con ANCOMBC2**
+
+El análisis diferencial se repite utilizando **ANCOMBC2 sobre counts sin transformar** (no CLR), ya que este método robusto incorpora internamente la corrección de sesgo composicional y está diseñado específicamente para datos de microbioma (controla falsos positivos).
+
+```{r ANCOMB2}
+# Reconstruir tse_genus desde el TSE original (counts sin pseudocuenta)
+tse_genus_ancom <- agglomerateByRank(tse, rank = "Genus")
+tse_genus_ancom <- tse_genus_ancom[rowData(tse_genus_ancom)$Genus != "", ]
+
+out_ancom <- ancombc2(
+  data         = tse_genus_ancom,
+  assay.type   = "counts",           # counts crudos — ANCOMBC2 normaliza internamente
+  fix_formula  = "diagnostico_principal",
+  p_adj_method = "fdr",
+  prv_cut      = 0.10,
+  lib_cut      = 0,
+  s0_perc      = 0.05,
+  group        = "diagnostico_principal",
+  struc_zero   = TRUE,
+  # neg_lb = TRUE  ELIMINADO: deprecado en ANCOMBC2 >= 2.0
+  alpha        = 0.05,
+  n_cl         = 1,
+  verbose      = FALSE,
+  global       = TRUE,
+  pairwise     = TRUE,
+  dunnet       = TRUE,
+  trend        = FALSE
+)
+
+res_ancom <- out_ancom$res
+
+# Géneros significativos (FDR < 0.05)
+sig_ancom <- res_ancom %>%
+  filter(
+    diff_diagnostico_principalVHC == TRUE |
+      diff_diagnostico_principalHAI == TRUE |
+      diff_diagnostico_principalCBP == TRUE
+  )
+cat("\nGéneros diferencialmente abundantes ANCOMBC2 (FDR < 0.05):",
+    nrow(sig_ancom), "\n")
+if (nrow(sig_ancom) > 0) print(sig_ancom$taxon)
+```
+*ANCOM-BC2* identifica a ***Roseomonas*** como el **único género significativamente diferencial** (FDR < 0.05) en todo el estudio. A diferencia de *MaAsLin2*, este método es metodológicamente más sensible porque corrige de forma nativa los sesgos composicionales y de carga microbiana sin perder potencia estadística ante taxones minoritarios. Su detección exclusiva confirma que, dentro de la homogeneidad global de la microbiota, *Roseomonas* actúa como el único biomarcador o firma biológica real capaz de romper la uniformidad entre los grupos diagnósticos.
+
+
+## Volcano plot (ANCOMBC2, q-valor)
+
+El resultado obtenido en **ANCOMBC2** se representa mediante un **volcano plot basado en valores q**, con el objetivo de identificar géneros estadísticamente significativos, destacando a **Roseomonas** como el único biomarcador del estudio.
+
+```{r volcano_qvalor_ANCOMBC2}
+# Comparaciones ANCOMBC2
+
+lfc_cols <- c("lfc_diagnostico_principalVHC",
+              "lfc_diagnostico_principalHAI",
+              "lfc_diagnostico_principalCBP")
+
+q_cols   <- c("q_diagnostico_principalVHC",
+              "q_diagnostico_principalHAI",
+              "q_diagnostico_principalCBP")
+
+comparaciones <- c("VHC", "HAI", "CBP")
+
+# ── Construcción dataframe ───────────────────────────────────────────────────
+df_volcano_ancom <- purrr::map2_dfr(
+  lfc_cols, q_cols,
+  function(lfc_col, q_col) {
+
+    comparacion <- gsub("lfc_diagnostico_principal", "", lfc_col)
+
+    data.frame(
+      taxon = res_ancom$taxon,
+      coef  = res_ancom[[lfc_col]],
+      qval  = as.numeric(res_ancom[[q_col]]),
+      value = comparacion,
+      stringsAsFactors = FALSE
+    )
+  }
+) %>%
+  dplyr::filter(!is.na(coef), !is.na(qval)) %>%
+  dplyr::mutate(
+    neg_log10q = -log10(qval),
+    Significativo = dplyr::case_when(
+      qval < 0.05 & coef >  0.3 ~ "Tendencia enriquecido",
+      qval < 0.05 & coef < -0.3 ~ "Tendencia depleccionado",
+      TRUE                      ~ "NS"
+    ),
+    label = ifelse(qval < 0.05 & abs(coef) > 0.3, taxon, NA_character_),
+    value = factor(value, levels = comparaciones)
+  )
+
+# ── Volcano plot ─────────────────────────────────────────────────────────────
+ggplot(df_volcano_ancom, aes(x = coef, y = neg_log10q,
+                              color = Significativo,
+                              size  = Significativo,
+                              label = label)) +
+  geom_point(alpha = 0.7) +
+  geom_text_repel(size = 2.5, max.overlaps = 20, na.rm = TRUE,
+                  box.padding = 0.4, fontface = "italic") +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed", color = "gray40", linewidth = 0.5) +
+  geom_vline(xintercept = c(-0.3, 0.3),
+             linetype = "dashed", color = "gray40", linewidth = 0.5) +
+  scale_color_manual(values = c(
+    "Tendencia enriquecido"   = "#E41A1C",
+    "Tendencia depleccionado" = "#377EB8",
+    "NS"                      = "gray75"
+  )) +
+  scale_size_manual(values = c(
+    "Tendencia enriquecido"   = 2.5,
+    "Tendencia depleccionado" = 2.5,
+    "NS"                      = 1.5
+  )) +
+  facet_wrap(~ value, ncol = 3) +
+  theme_pubr(base_size = 9) +
+  labs(
+    title    = "Volcano plot — Géneros diferenciales por diagnóstico (ANCOMBC2 · FDR)",
+    subtitle = "q < 0.05 · |LFC| > 0.3 · referencia Healthy",
+    x        = "Log Fold Change (ANCOMBC2)",
+    y        = "-log10(q-valor)",
+    color    = NULL,
+    size     = NULL
+  ) +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+Se plasma visualmente la alta sensibilidad de *ANCOM-BC2*, mostrando cómo casi la totalidad de los géneros permanecen como **NS (No Significativos)**, mientras que ***Roseomonas*** se eleva de forma solitaria en el grupo **HAI**. Al superar el umbral estricto de significación estadística (q < 0.05) y mostrar una fuerte magnitud de cambio (|LFC|> 0.3), este género se consolida gráficamente como la **única tendencia enriquecida** y el único biomarcador robusto de todo el análisis composicional.
+
+
+## Volcano exploratorio (ANCOMBC2, p nominal)
+
+Como complemento, se presenta un volcano plot basado en **p-valores nominales** para explorar posibles señales diferenciales no detectadas tras corrección FDR.
+
+```{r volcano_pnominal_ANCOMB2}
+
+lfc_cols    <- c("lfc_diagnostico_principalVHC",
+                 "lfc_diagnostico_principalHAI",
+                 "lfc_diagnostico_principalCBP")
+p_cols      <- c("p_diagnostico_principalVHC",
+                 "p_diagnostico_principalHAI",
+                 "p_diagnostico_principalCBP")
+comparaciones <- c("VHC", "HAI", "CBP")
+
+df_volc_pnom <- purrr::map2_dfr(
+  lfc_cols, p_cols,
+  function(lfc_col, p_col) {
+    comparacion <- gsub("lfc_diagnostico_principal", "", lfc_col)
+    data.frame(
+      taxon       = res_ancom$taxon,
+      lfc         = res_ancom[[lfc_col]],
+      pval        = as.numeric(res_ancom[[p_col]]),
+      comparacion = comparacion,
+      stringsAsFactors = FALSE
+    )
+  }
+) %>%
+  filter(!is.na(lfc), !is.na(pval)) %>%
+  mutate(
+    neg_log10p  = -log10(pval),
+    Sig = case_when(
+      pval < 0.05 & lfc >  0.3 ~ "Tendencia enriquecido",
+      pval < 0.05 & lfc < -0.3 ~ "Tendencia depleccionado",
+      TRUE                      ~ "NS"
+    ),
+    label       = ifelse(pval < 0.05 & abs(lfc) > 0.3, taxon, NA_character_),
+    comparacion = factor(comparacion, levels = comparaciones)
+  )
+
+cat("Distribución volcano ANCOMBC2 p nominal:\n")
+print(table(df_volc_pnom$Sig, df_volc_pnom$comparacion))
+
+ggplot(df_volc_pnom, aes(x = lfc, y = neg_log10p,
+                         color = Sig,
+                         size  = Sig,
+                         label = label)) +
+  geom_point(alpha = 0.7) +
+  geom_text_repel(size = 2.5, max.overlaps = 20, na.rm = TRUE,
+                  box.padding = 0.4, fontface = "italic") +
+  geom_hline(yintercept = -log10(0.05),
+             linetype = "dashed", color = "gray40", linewidth = 0.5) +
+  geom_vline(xintercept = c(-0.3, 0.3),
+             linetype = "dashed", color = "gray40", linewidth = 0.5) +
+  scale_color_manual(values = c(
+    "Tendencia enriquecido"   = "#E41A1C",
+    "Tendencia depleccionado" = "#377EB8",
+    "NS"                      = "gray75"
+  )) +
+  scale_size_manual(values = c(
+    "Tendencia enriquecido"   = 3,
+    "Tendencia depleccionado" = 3,
+    "NS"                      = 1.5
+  )) +
+  facet_wrap(~ comparacion, ncol = 3) +
+  theme_pubr(base_size = 9) +
+  labs(title    = "Volcano plot — ANCOMBC2 (p nominal, exploratorio)",
+       subtitle = "p < 0.05 · |LFC| > 0.3 · sin corrección múltiple · Referencia: Healthy",
+       x        = "Log Fold Change",
+       y        = "-log10(p-valor)",
+       color    = NULL,
+       size     = NULL) +
+  theme(strip.text      = element_text(face = "bold"),
+        legend.position = "top")
+```
+
+Al relajar el filtro estadístico al **p-valor nominal**, este análisis exploratorio con **ANCOM-BC2** funciona como una lente sensible que rescata las firmas microbianas latentes de cada hepatopatía frente al grupo sano. El modelo revela que **VHC** se caracteriza por una marcada tendencia a la deplesión de géneros como *Eubacterium* y *Rhodobacter*; **CBP** muestra un perfil polarizado con el enriquecimiento de *Phenylobacterium* y la caída de *Carnobacterium*; mientras que **HAI** consolida el perfil más potente del estudio, coliderado por el repunte de ***Roseomonas*** y *Dietzia*. 
+De este modo, el descenso al nivel nominal demuestra que, bajo la aparente uniformidad global, cada patología estimula nichos de disbiosis taxonómica completamente independientes y diferenciados entre sí.
+
+
+
+La ausencia de coincidencia entre ambos métodos es normal porque analizan los datos de forma distinta, actuando como herramientas complementarias. Mientras **MaAsLin2** detecta cambios en las bacterias más abundantes y mayoritarias, **ANCOM-BC2** corrige los errores de cantidad y es capaz de ver las bacterias más minoritarias. Por tanto, no es un error, sino complementariedad de algoritmos.

@@ -1,0 +1,708 @@
+---
+title: "Exploratorio NO supervisado"
+author: "María Sánchez Vivo"
+date: "2026-05-05"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# **Introducción**
+
+El script realiza un análisis multiómico integrado con el objetivo de caracterizar la relación entre microbiota, metabolitos y variables clínicas en distintos grupos de diagnóstico. Para ello, se integran y depuran múltiples fuentes de datos (metagenómica, metabolómica y clínica) en un marco común de análisis, donde se construyen objetos estructurados para microbiota y se armonizan las matrices de variables. 
+
+A nivel exploratorio, se aplican **técnicas de reducción de dimensionalidad lineales** y **no lineales (PCA, PCoA, UMAP y t-SNE)** tanto en metabolitos como en variables clínicas y datos microbianos, complementadas con métricas de distancia adecuadas para cada tipo de dato **(Bray-Curtis, euclidiana y Gower)**. Paralelamente, se evalúan diferencias entre grupos clínicos mediante pruebas **PERMANOVA**. 
+
+Finalmente, los resultados se integran en visualizaciones avanzadas como **heatmaps basados en variables seleccionadas por PCA** y **asociaciones estadísticas (V de Cramer)**, lo que permite identificar patrones conjuntos de variación biológica asociados al estado clínico y facilitar su interpretación global.
+
+
+# **Carga de librerías, datos y preparación inicial**
+
+Se cargan las librerías necesarias para el análisis multiómico y se importan los distintos conjuntos de datos (metabolitos, microbiota y variables clínicas) que posteriormente se integran en un único marco de trabajo. Además, se realiza una limpieza inicial de variables clínicas, se combinan con los metabolitos y se definen las variables categóricas y numéricas, así como la paleta de colores asociada a los distintos diagnósticos para su uso en los análisis y visualizaciones posteriores.
+
+```{r librerias_y_datos}
+library(FactoMineR)
+library(factoextra)
+library(uwot)          
+library(Rtsne)
+library(cluster)
+library(ggpubr)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(mia)
+library(miaViz)
+library(vegan)
+library(scater)
+library(tidyverse)
+library(RColorBrewer)
+
+datos_metabolitos      <- readRDS("metabolitos.rds")
+datos_metataxonomicos  <- readRDS("tax.rds")
+datos_clinicos         <- readRDS("covs.rds")
+datos_abundancia_16S   <- readRDS("metagen.rds")
+
+# Reconstruir datos_clinicos_metabolomicos
+datos_clinicos_limpios <- datos_clinicos %>%
+  as.data.frame() %>%
+  select(-ends_with("_0"))
+
+datos_clinicos_metabolomicos <- merge(datos_clinicos_limpios,
+                                      datos_metabolitos,
+                                      by = "Sample")
+
+nombres_metabolitos <- names(datos_metabolitos)[names(datos_metabolitos) != "Sample"]
+
+vars_id <- c("Sample", "diagnostico_principal")
+
+vars_cat <- datos_clinicos_metabolomicos %>%
+  select(-all_of(vars_id), -all_of(nombres_metabolitos)) %>%
+  select(where(~ is.factor(.) | is.character(.))) %>%
+  select(where(~ n_distinct(., na.rm = TRUE) >= 2)) %>%
+  names()
+
+vars_num <- datos_clinicos_metabolomicos %>%
+  select(-all_of(vars_id), -all_of(nombres_metabolitos)) %>%
+  select(where(is.numeric)) %>%
+  select(where(~ n_distinct(., na.rm = TRUE) >= 2)) %>%
+  names()
+
+paleta_dx <- c("CBP"     = "#E41A1C",
+               "Healthy" = "#4DAF4A",
+               "HAI"     = "#377EB8",
+               "VHC"     = "#FF7F00")
+```
+
+
+## **Construcción del objeto de análisis microbiológico**
+
+Se integran los datos de abundancia microbiana, taxonomía y variables clínicas en un objeto de tipo **TreeSummarizedExperiment**, asegurando la correcta alineación de muestras y taxones. Posteriormente, se transforma la tabla a **abundancia relativa** y se agrupan los **datos a nivel de género**, con el objetivo de facilitar los análisis exploratorios y comparativos.
+
+```{r tse}
+# Reconstruir TSE
+counts_prepared <- datos_abundancia_16S %>%
+  column_to_rownames("Sample") %>%
+  t() %>%
+  as.matrix()
+colnames(counts_prepared) <- trimws(colnames(counts_prepared))
+
+datos_clinicos_mia <- as.data.frame(datos_clinicos)
+rownames(datos_clinicos_mia) <- trimws(as.character(datos_clinicos_mia$Sample))
+
+tax_prepared <- datos_metataxonomicos %>%
+  as.data.frame() %>%
+  as.matrix()
+rownames(tax_prepared) <- trimws(rownames(tax_prepared))
+
+comun_muestras  <- intersect(colnames(counts_prepared), rownames(datos_clinicos_mia))
+counts_filtrado <- counts_prepared[, comun_muestras]
+clinicos_final  <- datos_clinicos_mia[comun_muestras, ]
+
+comun_taxones <- intersect(rownames(counts_filtrado), rownames(tax_prepared))
+counts_final  <- counts_filtrado[comun_taxones, ]
+tax_final     <- tax_prepared[comun_taxones, ]
+
+tse <- TreeSummarizedExperiment(
+  assays  = list(counts = as.matrix(counts_final)),
+  colData = DataFrame(clinicos_final),
+  rowData = DataFrame(tax_final)
+)
+tse <- transformAssay(tse, method = "relabundance")
+
+tse_genus <- agglomerateByRank(tse, rank = "Genus")
+tse_genus <- tse_genus[rowData(tse_genus)$Genus != "", ]
+tse_genus <- transformAssay(tse_genus, method = "relabundance")
+
+cat("Muestras:", nrow(datos_clinicos_metabolomicos), "\n")
+cat("Metabolitos:", length(nombres_metabolitos), "\n")
+cat("Géneros:", nrow(tse_genus), "\n")
+```
+
+# **Microbiota**
+
+# Análisis PCoA de microbiota y PERMANOVA
+
+En este apartado se calcula la **distancia Bray-Curtis** (sobre las abundancias relativas microbianas) y se aplica un **análisis PCoA para explorar la estructura global de la microbiota**. Después, se evalúan las diferencias entre grupos clínicos mediante **PERMANOVA** y se visualizan los resultados mediante elipses que representan la variabilidad por diagnóstico.
+
+```{r pcoa_microbiota}
+tse <- runMDS(tse,
+              FUN        = vegan::vegdist,
+              method     = "bray",
+              assay.type = "relabundance",     
+              name       = "PCoA_bray")
+
+# PERMANOVA sobre counts
+dist_bray <- vegdist(t(assay(tse, "counts")), method = "bray")
+set.seed(123)
+permanova <- adonis2(dist_bray ~ diagnostico_principal,
+                     data         = as.data.frame(colData(tse)),
+                     permutations = 999)
+print(permanova)
+
+# Extraer coordenadas
+pcoa_coords <- reducedDim(tse, "PCoA_bray")
+df_pcoa <- data.frame(
+  PC1         = pcoa_coords[, 1],
+  PC2         = pcoa_coords[, 2],
+  diagnostico = factor(colData(tse)$diagnostico_principal),
+  SampleID    = colData(tse)$Sample
+)
+
+# Elipse con alpha detrás de los puntos, label solo en geom_text_repel
+p_pcoa <- ggplot(df_pcoa, aes(x = PC1, y = PC2, color = diagnostico)) +
+  stat_ellipse(aes(group = diagnostico), type = "t",        # elipse primero (detrás)
+               linetype = "dashed", linewidth = 0.5,
+               alpha = 0.3, fill = NA) +
+  geom_point(size = 3, alpha = 0.8) +                        # puntos encima
+  geom_text_repel(aes(label = SampleID),                     # label solo aquí
+                  size = 2.5, max.overlaps = 10) +
+  scale_color_manual(values = paleta_dx) +
+  theme_pubr() +
+  labs(title    = "PCoA — Microbiota (Bray-Curtis, abundancias relativas)",
+       subtitle = paste0("PERMANOVA: R² = ",
+                         round(permanova$R2[1], 3),
+                         ", p = ", permanova$`Pr(>F)`[1]),
+       x = "PC1", y = "PC2", color = "Diagnóstico")
+print(p_pcoa)
+```
+
+El análisis de **beta-diversidad mediante PERMANOVA** y su visualización en el **PCoA** confirman que **no existen diferencias globales significativas en la composición de la microbiota entre los grupos de diagnóstico** (p = 0.662). Las elipses de confianza se solapan casi por completo en el gráfico, y la variable diagnóstica apenas explica un 5.75% de la variabilidad total observada (R^2 = 0.058), quedando el 94.24% restante asociado a la variabilidad individual (residuos). Este resultado estadístico ratifica la **homogeneidad global** de las muestras y justifica metodológicamente el uso de herramientas de alta sensibilidad, como *ANCOM-BC2* a nivel exploratorio, para poder rescatar aquellos taxones minoritarios específicos que logran romper esta uniformidad general.
+
+
+# **Metabolitos**
+
+## Análisis PCA de metabolitos y PERMANOVA 
+
+A continuación, se estandarizan los metabolitos y se aplica un **PCA** para reducir la dimensionalidad y explorar la variabilidad global del conjunto de datos. Después, se evalúan diferencias entre grupos clínicos mediante **PERMANOVA basada en distancia euclidiana**.
+
+```{r pca_metabolitos}
+# Escalar siempre los datos numéricos
+mat_met <- datos_clinicos_metabolomicos %>%
+  select(all_of(nombres_metabolitos)) %>%
+  scale()   # scale() siempre para comparativas
+rownames(mat_met) <- datos_clinicos_metabolomicos$Sample
+
+# PERMANOVA metabolitos (distancia Euclidiana sobre datos escalados)
+dist_eucl_met <- dist(mat_met, method = "euclidean")
+set.seed(123)
+permanova_met <- adonis2(dist_eucl_met ~ diagnostico_principal,
+                         data         = datos_clinicos_metabolomicos,
+                         permutations = 999)
+cat("=== PERMANOVA Metabolitos (Euclidiana, escalado) ===\n")
+print(permanova_met)
+
+pca_met <- PCA(mat_met, graph = FALSE, ncp = 10)
+
+# Varianza explicada
+fviz_eig(pca_met, addlabels = TRUE, ncp = 10) +
+  theme_pubr() +
+  labs(title = "PCA metabolitos — Varianza explicada por componente")
+```
+
+A diferencia de la microbiota (donde no había diferencias globales), el perfil metabolómico **sí separa de forma estadísticamente significativa a los grupos diagnósticos** (p = 0.001). El modelo **PERMANOVA** señala que la patología explica el **15.63% de la variabilidad total** de los metabolitos, una fuerza de asociación casi tres veces mayor que la bacteriana. Además, el *scree plot* del PCA valida el análisis bidimensional al concentrar el **40.1% de la varianza** en las dos primeras dimensiones (Dim 1: 27.1%; Dim 2: 13%), lo que anticipa una separación visual de los pacientes según su enfermedad.
+
+
+## Visualización PCA de metabolitos
+
+En este apartado se representa la distribución de las muestras en el espacio definido por el **PCA de metabolitos**, incorporando el diagnóstico clínico. Además, se añaden elipses de confianza para visualizar la separación entre grupos.
+
+
+```{r pca_individuos}
+
+fviz_pca_ind(pca_met,
+             col.ind      = datos_clinicos_metabolomicos$diagnostico_principal,
+             palette      = paleta_dx,
+             addEllipses  = TRUE,
+             ellipse.type = "confidence",
+             ellipse.alpha = 0.1,   
+             legend.title = "Diagnóstico",
+             repel        = TRUE,
+             label        = "none") +
+  theme_pubr() +
+  labs(title    = "PCA — Metabolitos",
+       subtitle = paste0("PC1: ", round(pca_met$eig[1, 2], 1), "% · ",
+                         "PC2: ", round(pca_met$eig[2, 2], 1), "% · ",
+                         "PERMANOVA R²=", round(permanova_met$R2[1], 3),
+                         " p=", permanova_met$`Pr(>F)`[1]))
+```
+
+El **score plot del PCA** plasma visualmente la separación significativa confirmada por el PERMANOVA (p=0.001), donde la **Dimensión 1 (27.1%)** divide las muestras horizontalmente al desplazar a **VHC y CBP** hacia la derecha (valores positivos) y mantener a **Healthy y HAI** hacia la izquierda (valores negativos), evidenciando que las dos primeras hepatopatías comparten una firma metabólica muy similar. 
+Por su parte, la **Dimensión 2 (13%)** aporta la especificidad patológica vertical al separar de forma neta la elipse de **HAI** (cuadrante superior) del grupo control **Healthy** (cuadrante inferior). Así, el gráfico demuestra que **HAI presenta el perfil más distante y diferenciado** frente al resto de las enfermedades, confirmando que cada patología induce una huella metabólica plasmática con entidad propia.
+
+## Interpretación de variables en PCA de metabolitos
+
+Después, se identifican los **metabolitos con mayor contribución a los dos primeros componentes principales del PCA**, con el objetivo de interpretar las principales fuentes de variabilidad en los datos.
+
+
+```{r pca_variables}
+fviz_pca_var(pca_met,
+             col.var       = "contrib",
+             gradient.cols = c("#377EB8", "#4DAF4A", "#E41A1C"),
+             repel         = TRUE,
+             select.var    = list(contrib = 15)) +
+  theme_pubr() +
+  labs(title = "PCA metabolitos — Contribución de variables (top 15)")
+```
+
+El **gráfico de correlación de variables (loading plot)** identifica qué metabolitos dirigen la separación de los pacientes, destacando por su máxima contribución (color rojo/naranja) **methylmalonic_acid, succinate, orotate** y **leucine_isoleucine**. Al conectar este gráfico con el de puntuaciones (*score plot*), se deduce la firma metabólica de cada grupo: hacia el cuadrante superior derecho, la elevación de **leucine_isoleucine, tyrosine y hypoxanthine** caracteriza la transición hacia **VHC y CBP**; en el cuadrante inferior derecho, la fuerte acumulación de **methylmalonic_acid, succinate y orotate** se alinea perfectamente con la dirección de las muestras de **VHC**; mientras que en el cuadrante superior izquierdo, el incremento de aminoácidos como **sarcosine, alanine y proline** coincide de forma exclusiva con el perfil de los pacientes con **HAI**.
+
+## Análisis UMAP de metabolitos
+
+A continuación, se aplica **UMAP** a los metabolitos probando distintos valores de vecinos *(n_neighbors)* para evaluar la estabilidad del embedding y explorar la estructura de agrupamiento en el espacio reducido.
+
+```{r umap_metabolitos}
+set.seed(42)
+
+# Probar distintos n_neighbors (por defecto 15, pero coge casi el 40% de pacientes)
+for (nn in c(3, 5, 7, 15)) {
+  set.seed(42)
+  umap_res <- umap(mat_met,
+                   n_neighbors = nn,
+                   min_dist    = 0.1,
+                   metric      = "euclidean")
+  
+  df_umap <- data.frame(
+    UMAP1       = umap_res[, 1],
+    UMAP2       = umap_res[, 2],
+    diagnostico = factor(datos_clinicos_metabolomicos$diagnostico_principal)
+  )
+  
+  #Elipse con alpha detrás de los puntos
+  p <- ggplot(df_umap, aes(x = UMAP1, y = UMAP2, color = diagnostico)) +
+    stat_ellipse(aes(group = diagnostico), type = "t",
+                 linetype = "dashed", linewidth = 0.5, alpha = 0.3) +
+    geom_point(size = 3, alpha = 0.8) +
+    scale_color_manual(values = paleta_dx) +
+    theme_pubr() +
+    labs(title    = paste0("UMAP metabolitos — n_neighbors = ", nn),
+         subtitle = "(uwot)",
+         color    = "Diagnóstico")
+  print(p)
+}
+```
+
+La optimización del hiperparámetro *n_neighbors* en el análisis **UMAP** de metabolitos demuestra de forma robusta la existencia de subestructuras no lineales dentro de la población, actuando el valor **n_neighbors = 3** como el ajuste óptimo del estudio. Con este valor bajo de vecindad, el algoritmo maximiza la sensibilidad hacia las relaciones locales y desvela un patrón de agrupamiento donde los pacientes con **HAI** forman un clúster compacto y aislado en el espacio izquierdo, mientras que **VHC y CBP** vuelven a manifestar su estrecha similitud metabólica al co-localizarse en un macro-clúster disperso hacia la derecha. A medida que este parámetro se incrementa progresivamente (5, 7 y 15), el modelo prioriza la estructura global sobre las distancias locales individuales, lo que provoca una pérdida paulatina de la resolución de los grupos y difumina las elipses de confianza en un solapamiento continuo similar al del PCA. Este comportamiento dinámico valida que la firma metabólica de la **HAI posee una identidad local única y diferenciada** que solo los modelos de alta resolución geométrica logran capturar por completo.
+
+
+## Análisis t-SNE de metabolitos
+
+En este apartado se utiliza **t-SNE** para proyectar los metabolitos en un espacio bidimensional no lineal, con el objetivo de visualizar posibles agrupamientos asociados al diagnóstico clínico.
+
+```{r tsne_metabolitos}
+set.seed(42)
+
+# Probamos exclusivamente los valores válidos y óptimos para tu cohorte (literatura)
+for (perp in c(5, 8, 10, 15)) { 
+  
+  # Ejecución de t-SNE adaptando la perplejidad de forma dinámica
+  tsne_met <- Rtsne(mat_met,
+                    perplexity       = perp,  # Cambia en cada vuelta del ciclo
+                    dims             = 2,
+                    max_iter         = 1000,
+                    check_duplicates = FALSE)
+  
+  # Construcción del dataframe temporal para esta iteración
+  df_tsne_met <- data.frame(
+    tSNE1       = tsne_met$Y[, 1],
+    tSNE2       = tsne_met$Y[, 2],
+    diagnostico = factor(datos_clinicos_metabolomicos$diagnostico_principal)
+  )
+  
+  # Generación del gráfico adaptando el título y subtítulo al valor de 'perp'
+  p <- ggplot(df_tsne_met, aes(x = tSNE1, y = tSNE2, color = diagnostico)) +
+    stat_ellipse(aes(group = diagnostico), type = "t",
+                 linetype = "dashed", linewidth = 0.5, alpha = 0.3) +
+    geom_point(size = 3, alpha = 0.8) +
+    scale_color_manual(values = paleta_dx) +
+    theme_pubr() +
+    labs(title    = paste0("t-SNE — Metabolitos | Perplexity = ", perp),
+         subtitle = paste0("(N = 46 pacientes | Reducción de dimensionalidad no lineal)"),
+         x        = "t-SNE Dimensión 1",
+         y        = "t-SNE Dimensión 2",
+         color    = "Diagnóstico")
+  
+  print(p)
+}
+```
+
+El análisis de los gráficos demuestra que **t-SNE tiende a la homogeneización y no logra establecer fronteras limpias** entre las hepatopatías, independientemente de la configuración utilizada. Con valores bajos (Perplexity = 5 - 8), el algoritmo genera agrupaciones locales dispersas y artificiales que fragmentan las muestras sin una lógica patológica aparente. Al avanzar hacia valores moderados (Perplexity = 10- 15), el modelo estabiliza la estructura global distribuyendo a los pacientes con **VHC y CBP** de forma solapada por todo el espacio, mientras que **HAI** y los controles **Healthy** exhiben una sutil tendencia a agruparse en los cuadrantes izquierdos e inferiores, aunque manteniéndose encerrados bajo elipses de confianza masivas y superpuestas. 
+
+Este comportamiento dinámico ratifica que la topología de los datos metabolómicos no se adapta bien a las restricciones de t-SNE, confirmando que este método difumina la especificidad patológica que otros enfoques (como UMAP) sí logran capturar.
+
+
+# **Variables clínicas**
+
+## Análisis de variables clínicas (Gower, UMAP, t-SNE y PERMANOVA)
+
+Después, se estandarizan las variables clínicas numéricas y categóricas y se calcula la **distancia de Gower para integrar datos mixtos**. A partir de esta matriz se evalúan las diferencias entre grupos clínicos mediante **PERMANOVA**.
+
+```{r gower_clinica}
+# scale() dentro de mutate necesita as.numeric() para devolver vector en lugar de matriz, que es lo que daisy() requiere
+
+df_clinica_gower <- datos_clinicos_metabolomicos %>%
+  select(all_of(vars_num), all_of(vars_cat)) %>%
+  mutate(across(all_of(vars_num), ~ as.numeric(scale(.)))) %>%  
+  mutate(across(all_of(vars_cat), as.factor))
+
+# Verificar tipos de columna antes de daisy
+cat("Tipos de columnas (primeras 5):\n")
+print(sapply(df_clinica_gower[, 1:5], class))
+
+dist_gower <- daisy(df_clinica_gower, metric = "gower")
+cat("Rango distancia Gower:", range(as.matrix(dist_gower)), "\n")
+
+# PERMANOVA clínica (Gower)
+set.seed(123)
+permanova_clin <- adonis2(dist_gower ~ diagnostico_principal,
+                          data         = datos_clinicos_metabolomicos,
+                          permutations = 999)
+cat("=== PERMANOVA Clínica (Gower, escalado) ===\n")
+print(permanova_clin)
+```
+
+El análisis mediante **PERMANOVA** con distancia de Gower revela que el perfil clínico diferencia de forma muy potente y estadísticamente significativa a los grupos diagnósticos (p = 0.001), demostrando que la patología explica un sólido **25.07% de la variabilidad total** de los datos (R^2 = 0.251). Este tamaño del efecto es metodológicamente el más elevado de todo el estudio multiómico, superando al 15.63% de la metabolómica y al 5.75% de la microbiota. De este modo, los **datos clínicos se consolidan como el conjunto de variables con mayor fuerza de asociación y capacidad de separación biológica para discriminar entre las diferentes hepatopatías de la cohorte**.
+
+
+## Visualización UMAP de variables clínicas
+
+En este apartado se proyectan las variables clínicas mediante **UMAP basado en la distancia de Gower**, explorando la estructura de los pacientes y evaluando la estabilidad del resultado con distintos números de vecinos.
+
+```{r umap_gower}
+set.seed(42)
+
+# Convertimos la matriz de Gower en un objeto de clase 'dist' nativo de R.
+# Esto le avisa a uwot de forma automática que NO use el motor Annoy.
+dist_gower_objeto <- as.dist(dist_gower)
+
+# Probamos los valores 3, 5, 7 y 15 neighbors de forma secuencial
+for (nn in c(3, 5, 7, 15)) {
+  
+  # Al pasar un objeto 'dist', quitamos el argumento metric = "precomputed"
+  umap_gower <- umap(dist_gower_objeto,
+                     n_neighbors = nn,
+                     min_dist    = 0.1) 
+  
+  # Construcción del dataframe temporal para esta iteración
+  df_umap_gower <- data.frame(
+    UMAP1       = umap_gower[, 1],
+    UMAP2       = umap_gower[, 2],
+    diagnostico = factor(datos_clinicos_metabolomicos$diagnostico_principal)
+  )
+  
+  # Generación del gráfico dinámico con la paleta correspondiente
+  p <- ggplot(df_umap_gower, aes(x = UMAP1, y = UMAP2, color = diagnostico)) +
+    stat_ellipse(aes(group = diagnostico), type = "t",
+                 linetype = "dashed", linewidth = 0.5, alpha = 0.3) +
+    geom_point(size = 3, alpha = 0.8) +
+    scale_color_manual(values = paleta_dx) +
+    theme_pubr() +
+    labs(title    = paste0("UMAP — Variables clínicas (Gower) | n_neighbors = ", nn),
+         subtitle = paste0("PERMANOVA: R² = ", round(permanova_clin$R2[1], 3),
+                           " | p = ", permanova_clin$`Pr(>F)`[1]),
+         color    = "Diagnóstico")
+  
+  print(p)
+}
+```
+
+El análisis de reducción de dimensionalidad no lineal mediante **UMAP** aplicado a las variables clínicas confirma la sólida separación diagnóstica arrojada por el PERMANOVA (p=0.001, R^2=0.251). Bajo una configuración de alta resolución local (**n_neighbors = 3**), el algoritmo desvela: un microclúster hipercompacto y aislado a la izquierda que agrupa a pacientes de diversas condiciones clínicas (sugiriendo un subgrupo fenotípico altamente homogéneo), y un macroclúster a la derecha donde co-localizan de forma integrada las muestras restantes de **Healthy, VHC, HAI y CBP**. A medida que el hiperparámetro se incrementa de forma progresiva (5, 7 y 15), el modelo transiciona desde este detalle geométrico local hacia la preservación de la estructura macroscópica global. Este cambio dinámico disuelve los clústeres discretos y estira las muestras a lo largo de un continuo diagonal difuso donde las elipses de confianza se solapan de manera masiva, demostrando que la verdadera señal discriminatoria de los datos clínicos reside en sus sutiles relaciones de vecindad local.
+
+
+## Visualización t-SNE de variables clínicas
+
+A continuación, se aplica **t-SNE** a las variables clínicas para representar a los pacientes en un espacio de baja dimensionalidad y explorar patrones de agrupamiento según diagnóstico.
+
+```{r tsne_gower}
+set.seed(42)
+
+# Se prueban valores válidos y óptimos para N = 46
+for (perp in c(5, 8, 10, 15)) {
+  
+  # Ejecución de t-SNE sobre tu matriz de metabolitos
+  tsne_res <- Rtsne(mat_met, 
+                    perplexity = perp, 
+                    check_duplicates = FALSE, 
+                    pca = TRUE) # Mantiene la reducción de ruido por PCA previa
+  
+  # Construcción del dataframe compatible con las etiquetas clínicas
+  df_tsne <- data.frame(
+    tSNE1       = tsne_res$Y[, 1],
+    tSNE2       = tsne_res$Y[, 2],
+    diagnostico = factor(datos_clinicos_metabolomicos$diagnostico_principal)
+  )
+  
+  # Gráfico final con elipses y paleta_dx
+  p <- ggplot(df_tsne, aes(x = tSNE1, y = tSNE2, color = diagnostico)) +
+    stat_ellipse(aes(group = diagnostico), type = "t",
+                 linetype = "dashed", linewidth = 0.5, alpha = 0.3) +
+    geom_point(size = 3, alpha = 0.8) +
+    scale_color_manual(values = paleta_dx) +
+    theme_pubr() +
+    labs(title    = paste0("t-SNE metabolitos — Perplexity = ", perp),
+         x        = "t-SNE Dimensión 1",
+         y        = "t-SNE Dimensión 2",
+         color    = "Diagnóstico")
+  
+  print(p)
+}
+```
+
+El análisis dinámico de la perplejidad en el **t-SNE clínico** demuestra que este algoritmo tiende a diluir la señal diagnóstica debido a su sensibilidad hacia las densidades globales, forzando la distribución de las muestras en una estructura bimodal recurrente (un microclúster aislado y un macroclúster laxo) en lugar de segregarlas por patología. Con un valor bajo (Perplexity = 5), los datos se fragmentan en núcleos artificiales sin lógica biológica, mientras que a valores estables (8, 10 y 15), los pacientes con **CBP, HAI, VHC y controles** se mezclan de forma concéntrica bajo elipses de confianza masivas y superpuestas, lo que confirma la **incapacidad de t-SNE para delimitar con éxito estas hepatopatías en comparación con la nitidez interpretativa local que ofrece el modelo UMAP**.
+
+
+# **HEATMAPs** 
+
+## Heatmap de metabolitos basado en PCA
+
+Después, se seleccionan los metabolitos con mayor contribución a los componentes principales del PCA y se construye un heatmap para visualizar sus patrones de abundancia entre muestras, incorporando anotación por diagnóstico.
+
+```{r heatmap_top_pca_metabolitos, fig.width=12, fig.height=10}
+#Heatmap con variables más importantes del PCA (top contribuyentes a PC1 y PC2, no todas las variables)
+
+contrib_pc1 <- pca_met$var$contrib[, 1]
+contrib_pc2 <- pca_met$var$contrib[, 2]
+
+top_pc1 <- names(sort(contrib_pc1, decreasing = TRUE))[1:15]
+top_pc2 <- names(sort(contrib_pc2, decreasing = TRUE))[1:15]
+top_vars_pca <- unique(c(top_pc1, top_pc2))
+
+cat("Variables seleccionadas para heatmap:", length(top_vars_pca), "\n")
+
+# Matriz escalada con solo esas variables
+mat_hm_top <- t(scale(as.matrix(
+  datos_clinicos_metabolomicos[, top_vars_pca]
+)))
+colnames(mat_hm_top) <- datos_clinicos_metabolomicos$Sample
+
+col_anno <- HeatmapAnnotation(
+  Diagnóstico = datos_clinicos_metabolomicos$diagnostico_principal,
+  col         = list(Diagnóstico = paleta_dx),
+  annotation_legend_param = list(
+    Diagnóstico = list(title = "Diagnóstico")
+  )
+)
+
+col_fun <- colorRamp2(c(-3, 0, 3),
+                      c("#377EB8", "white", "#E41A1C"))
+
+Heatmap(mat_hm_top,
+        name                      = "Z-score",
+        col                       = col_fun,
+        top_annotation            = col_anno,
+        clustering_method_rows    = "ward.D2",
+        clustering_method_columns = "ward.D2",
+        show_column_names         = FALSE,
+        show_row_names            = TRUE,
+        row_names_gp              = gpar(fontsize = 7),
+        column_title              = "Muestras",
+        row_title                 = "Top variables PCA (PC1+PC2)",
+        heatmap_legend_param      = list(title = "Z-score"))
+```
+
+Este mapa de calor (*heatmap*) muestra los niveles de abundancia relativos (escalados como Z-score) de los principales metabolitos identificados mediante un PCA, agrupando las muestras biológicas en las columnas y las variables en las filas según su similitud jerárquica. La barra de diagnóstico superior clasifica los sujetos en cuatro grupos: **Healthy** (Sano, verde), **VHC** (Hepatitis C, naranja), **HAI** (Hepatitis Autoinmune, azul) y **CBP** (Cirrosis Biliar Primaria, rojo). Se observa un patrón claro de diferenciación metabólica donde un grupo de muestras (compuesto predominantemente por pacientes con CBP y VHC, acumulados hacia la izquierda) exhibe una marcada sobreexpresión (tonos rojos intensos) de aminoácidos y ácidos orgánicos como tirosina, leucina/isoleucina, sarcosina, alanina y valina, mientras que el grupo de la derecha (donde se concentran los controles sanos en verde) muestra niveles significativamente más bajos o depletados (tonos azules) de estos mismos biomarcadores, lo que evidencia perfiles metabólicos marcadamente alterados según el tipo de patología hepática.
+
+
+
+## Heatmap clínico integrado (variables numéricas y categóricas)
+
+En este apartado se seleccionan variables clínicas relevantes mediante PCA y V de Cramer, y se integran en un heatmap conjunto que permite relacionar patrones multivariantes con los distintos grupos de diagnóstico.
+
+```{r heatmap_clinica_top_pca}
+# HEATMAP VARIABLES CLÍNICAS — top PCA
+
+# SELECCIÓN ESTADÍSTICA E INTEGRACIÓN EN HEATMAP CLÍNICO 
+
+# 1. Crear un data frame vacío para guardar los resultados de las 80 variables
+resultados_cat <- data.frame(Variable = character(), Cramer_V = numeric(), stringsAsFactors = FALSE)
+
+# 2. Correr el bucle para calcular la V de Cramér de cada variable vs el Diagnóstico
+for (var in vars_cat) {
+  tabla <- table(datos_clinicos_metabolomicos[[var]], datos_clinicos_metabolomicos$diagnostico_principal)
+  
+  tryCatch({
+    stat_res <- vcd::assocstats(tabla)
+    cramer_v <- stat_res$cramer
+    if(!is.na(cramer_v)) {
+      resultados_cat <- rbind(resultados_cat, data.frame(Variable = var, Cramer_V = cramer_v))
+    }
+  }, error = function(e) { NULL })
+}
+
+# 3. Ordenar las variables de mayor a menor asociación y elegir las TOP 5
+top_variables_estadisticas <- resultados_cat %>%
+  arrange(desc(Cramer_V)) %>%
+  slice_head(n = 5) %>%  
+  pull(Variable)
+
+cat("Las variables categóricas seleccionadas matemáticamente son:\n")
+print(top_variables_estadisticas)
+
+
+# 4. Preparar el data frame de anotaciones con las variables seleccionadas
+df_anotaciones_cat <- datos_clinicos_metabolomicos %>%
+  select(diagnostico_principal, all_of(top_variables_estadisticas)) %>% 
+  as.data.frame()
+
+rownames(df_anotaciones_cat) <- datos_clinicos_metabolomicos$Sample
+
+
+# 5. ASIGNACIÓN AUTOMÁTICA DE COLORES ELEGANTES (RColorBrewer)
+# Iniciamos la lista de colores con tu paleta fija de diagnóstico
+lista_colores_elegantes <- list(diagnostico_principal = paleta_dx)
+
+# Extraemos colores estéticos pasteles para las variables categóricas seleccionadas
+colores_pastel <- brewer.pal(12, "Set3") # Una paleta muy elegante para categorías
+contador_color <- 1
+
+for (nom_var in top_variables_estadisticas) {
+  # Buscamos qué grupos únicos tiene esta variable 
+  grupos_unicos <- unique(na.omit(df_anotaciones_cat[[nom_var]]))
+  n_grupos      <- length(grupos_unicos)
+  
+  # Tomamos un subconjunto de colores para estos grupos
+  colores_asignados <- colores_pastel[contador_color:(contador_color + n_grupos - 1)]
+  names(colores_asignados) <- grupos_unicos
+  
+  # Guardamos la paleta para esta variable específica
+  lista_colores_elegantes[[nom_var]] <- colores_asignados
+  
+  # Avanzamos el contador para que la siguiente variable use colores distintos
+  contador_color <- contador_color + n_grupos
+}
+
+
+# 6. Construir la anotación superior con la nueva lista de colores
+col_anno <- HeatmapAnnotation(
+  df  = df_anotaciones_cat,
+  col = lista_colores_elegantes,
+  annotation_name_gp = gpar(fontsize = 8, fontface = "bold") 
+)
+
+# 7. PCA de variables clínicas numéricas (escaladas)
+mat_clin_scaled <- scale(as.matrix(
+  datos_clinicos_metabolomicos[, vars_num]
+))
+rownames(mat_clin_scaled) <- datos_clinicos_metabolomicos$Sample
+
+pca_clin <- PCA(mat_clin_scaled, graph = FALSE, ncp = 10)
+
+# Top variables contribuyentes a PC1 y PC2
+contrib_clin_pc1 <- pca_clin$var$contrib[, 1]
+contrib_clin_pc2 <- pca_clin$var$contrib[, 2]
+top_clin_pc1 <- names(sort(contrib_clin_pc1, decreasing = TRUE))[1:12]
+top_clin_pc2 <- names(sort(contrib_clin_pc2, decreasing = TRUE))[1:12]
+top_vars_clin_pca <- unique(c(top_clin_pc1, top_clin_pc2))
+
+mat_hm_clin_pca <- t(scale(as.matrix(
+  datos_clinicos_metabolomicos[, top_vars_clin_pca]
+)))
+colnames(mat_hm_clin_pca) <- datos_clinicos_metabolomicos$Sample
+
+col_fun <- colorRamp2(c(-3, 0, 3), c("#377EB8", "white", "#E41A1C"))
+
+
+# 8. DIBUJAR EL HEATMAP FINAL 
+pdf("Heatmap_Clinico_Top_PCA_y_Categoricas.pdf", width = 12, height = 10)
+
+Heatmap(mat_hm_clin_pca,
+        name                      = "Z-score",
+        col                       = col_fun,
+        top_annotation            = col_anno, 
+        clustering_method_rows    = "ward.D2",
+        clustering_method_columns = "ward.D2",
+        show_column_names         = FALSE,
+        show_row_names            = TRUE,
+        row_names_gp              = gpar(fontsize = 7),
+        column_title              = "Muestras",
+        row_title                 = "Variables clínicas — top PCA (PC1+PC2)",
+        heatmap_legend_param      = list(title = "Z-score"))
+
+dev.off()
+```
+
+Para facilitar la integración de datos y evitar sesgos en el análisis multivariante, el cuerpo principal del mapa de calor se restringió exclusivamente a las variables clínicas numéricas continuas que mostraron mayor peso en los dos primeros componentes principales (PC1 y PC2) del PCA. Por su parte, el diagnóstico principal y las 5 variables categóricas con mayor fuerza de asociación estadística —seleccionadas de forma objetiva mediante un análisis previo de V de Cramer— se incorporaron exclusivamente como barras de anotación horizontal alineadas en la región superior del gráfico, permitiendo evaluar de manera visual y directa la correspondencia entre los clústeres clínicos cuantitativos de las muestras y sus perfiles cualitativos basales.»
+
+
+El resultado (en pdf) muestra la abundancia relativa (escala Z-score) de **variables clínicas** extraídas de un análisis de componentes principales (PCA), agrupando jerárquicamente las muestras (columnas) y los parámetros clínicos e histológicos (filas). En la parte superior, múltiples barras de anotación vinculan las muestras con metadatos clave, destacando el `diagnostico_principal` (Sanos en verde, VHC en naranja, HAI en azul y CBP en rojo), la presencia de anticuerpos (`anti_vhc_1`, `ama_1`) y rasgos histológicos como plasmocitos. Al igual que en los perfiles metabólicos, se observa una clara polarización clínica: el bloque izquierdo, dominado por pacientes con patologías activas (CBP, HAI y VHC), muestra una marcada elevación (tonos rojos) de enzimas hepáticas (`alt`, `ast`), bilirrubina total, marcadores de coagulación (`inr`) y daño histológico (`n_ep_inflamados`, `n_espacos_porta_ep`), reflejando un estado de inflamación y disfunción hepática severa. Por el contrario, el bloque de la derecha agrupa de forma casi exclusiva a los controles sanos (`Healthy`), caracterizados por un perfil homogéneo de niveles bajos o basales (tonos azules y blancos) en todos los marcadores de daño, confirmando la validez de estas variables clínicas para discriminar con precisión el estado de salud frente a las distintas hepatopatías.
+
+## Heatmap de bacterias (CLR + PCA)
+
+Finalmente, se filtran géneros bacterianos según prevalencia y abundancia, se aplica una transformación CLR para corregir sesgos composicionales y se seleccionan los taxones más relevantes mediante PCA para su representación comparativa entre grupos clínicos.
+
+```{r heatmap_bacterias_top_pca}
+# HEATMAP BACTERIAS — top PCA (Utilizando CLR)
+
+# 1. Filtrar géneros prevalentes y abundantes sobre abundancia relativa
+prevalencia  <- rowMeans(assay(tse_genus, "relabundance") > 0)
+abund_media  <- rowMeans(assay(tse_genus, "relabundance"))
+generos_filt <- names(which(prevalencia >= 0.2 & abund_media >= 0.001))
+
+# Filtrar el objeto original con los géneros seleccionados
+tse_genus_filt <- tse_genus[generos_filt, ]
+
+# 2. Calcular la transformación CLR clásica sobre el objeto filtrado
+# CORRECCIÓN: Cambiado pseudocount = TRUE por pseudocount = 1 (Estándar de mia)
+tse_genus_filt <- transformAssay(tse_genus_filt, 
+                                 assay.type  = "counts", 
+                                 method      = "clr", 
+                                 pseudocount = 1)
+
+# Extraer la matriz CLR (muestras en filas, bacterias en columnas)
+mat_bact_clr <- t(assay(tse_genus_filt, "clr"))
+
+# 3. Alinear con muestras del dataset clínico
+muestras_comun <- intersect(rownames(mat_bact_clr), datos_clinicos_metabolomicos$Sample)
+mat_bact_al <- mat_bact_clr[muestras_comun, ]
+
+# 4. PCA sobre bacterias usando la matriz de composición CLR pura
+mat_bact_scaled <- scale(mat_bact_al)
+pca_bact <- PCA(mat_bact_scaled, graph = FALSE, ncp = 10)
+
+# Extraer los taxones que más varían/contribuyen en los dos primeros componentes
+contrib_bact_pc1 <- pca_bact$var$contrib[, 1]
+contrib_bact_pc2 <- pca_bact$var$contrib[, 2]
+top_bact_pc1     <- names(sort(contrib_bact_pc1, decreasing = TRUE))[1:15]
+top_bact_pc2     <- names(sort(contrib_bact_pc2, decreasing = TRUE))[1:15]
+top_vars_bact_pca <- unique(c(top_bact_pc1, top_bact_pc2))
+
+cat("Géneros seleccionados por PCA (CLR):", length(top_vars_bact_pca), "\n")
+
+# 5. Configurar datos para el Heatmap Visual
+idx_muestras <- match(muestras_comun, datos_clinicos_metabolomicos$Sample)
+
+# Para la representación visual aplicamos Z-score sobre los valores CLR seleccionados
+mat_hm_bact_pca <- t(scale(mat_bact_al[, top_vars_bact_pca]))
+colnames(mat_hm_bact_pca) <- muestras_comun
+
+# Definir la función de color divergente (Azul = bajo / Blanco = media / Rojo = alto)
+col_fun <- colorRamp2(c(-3, 0, 3), c("#377EB8", "white", "#E41A1C"))
+
+# Crear la barra de anotación superior (Diagnóstico)
+col_anno_bact <- HeatmapAnnotation(
+  Diagnóstico = datos_clinicos_metabolomicos$diagnostico_principal[idx_muestras],
+  col = list(Diagnóstico = paleta_dx)
+)
+
+# Dibujar el Heatmap final (CORRECCIÓN: Se cerraron los paréntesis correctamente)
+Heatmap(mat_hm_bact_pca,
+        name                      = "Z-score",
+        col                       = col_fun,
+        top_annotation            = col_anno_bact,
+        clustering_method_rows    = "ward.D2",
+        clustering_method_columns = "ward.D2",
+        show_column_names         = FALSE,
+        show_row_names            = TRUE,
+        row_names_gp              = gpar(fontsize = 4, fontface = "italic"),
+        column_title              = "Muestras",
+        row_title                 = "Microbiota — top PCA (PC1+PC2 con CLR)",
+        heatmap_legend_param      = list(title = "Z-score"))
+```
+
+Este *heatmap* representa la abundancia relativa (escala Z-score tras una transformación CLR) de los **géneros bacterianos** más representativos derivados de un análisis de componentes principales (PCA), organizando jerárquicamente tanto las muestras (columnas) como los taxones (filas). A diferencia de los perfiles metabólicos y clínicos previos, el dendrograma superior revela una **menor separación o agrupamiento neto** basado estrictamente en el `Diagnóstico` (Sano en verde, VHC en naranja, HAI en azul y CBP en rojo), mostrando una distribución mucho más entremezclada de los grupos patológicos y los controles a lo largo del eje horizontal. A pesar de esta heterogeneidad general, se aprecian subgrupos específicos con firmas de disbiosis interesantes; por ejemplo, un bloque de pacientes con CBP y HAI hacia el extremo derecho exhibe una marcada depleción (tonos azules intensos) de géneros comensales o ambientales comunes como *Streptococcus*, *Haemophilus*, *Anaerococcus* y *Micrococcus*, mientras que ciertos géneros como *Corynebacterium*, *Propionibacterium* y *Staphylococcus* muestran picos de sobreabundancia (tonos rojos) localizados en muestras patológicas específicas, sugiriendo que las alteraciones de la microbiota hepática o sistémica en estas enfermedades son más sutiles, heterogéneas y variables entre individuos que sus respuestas metabólicas y clínicas.

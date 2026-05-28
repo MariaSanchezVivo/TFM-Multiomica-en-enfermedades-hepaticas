@@ -1,0 +1,792 @@
+---
+title: "Análisis exploratorio"
+author: "María Sánchez Vivo"
+date: "2026-05-05"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE,message = FALSE)
+```
+
+# **Introducción**
+
+En este script se realiza un análisis exploratorio básico para ver los datos de los que se dispone (ver cuántas muestras hay de cada enfermedad, cuántos H/M hay, si las muestras están también en el archivo de datos metataxonómicos) y comprobar que está todo limpio, es decir, que no hay ninguna fila ni columna repetidas ni valores nulos, NA.
+
+
+# **Análisis básico**
+
+Se empieza por la carga de datos: datos clínicos, metabolómicos, metataxonómicos y datos de abundancia 16S. 
+
+```{r carga_datos}
+datos_metabolitos <- readRDS("metabolitos.rds")
+datos_metataxonomicos <- readRDS("tax.rds")
+datos_clinicos <- readRDS("covs.rds")
+datos_abundancia_16S <- readRDS("metagen.rds")
+```
+
+Contamos con 46 muestras y 1444 datos metataxonómicos encontrados en las mismas, gracias a secuenciación 16S.
+
+Antes de comenzar el análisis, se realiza una primera exploración para comprobar la calidad de los datos. En concreto, se evalúa la presencia de columnas o filas duplicadas, así como la existencia de valores perdidos (NA) en los distintos datasets.
+
+```{r columnas_filas_repetidas_NA}
+#Ver si hay columnas repetidas en datasets
+sapply(list(datos_abundancia_16S, datos_clinicos, datos_metabolitos, datos_metataxonomicos), \(x) any(duplicated(names(x))))
+
+#Ver si hay filas repetidas en datasets
+sapply(list(datos_abundancia_16S, datos_clinicos, datos_metabolitos, datos_metataxonomicos), \(x) any(duplicated(x)))
+
+#Ver si hay NAs en datasets
+sapply(list(datos_abundancia_16S, datos_clinicos, datos_metabolitos, datos_metataxonomicos), \(x) any(is.na(x)))
+```
+
+No hay ninguna variable (columnas) ni datos (filas) repetidos en ningún archivo, tampoco hay presente ningún NA.
+
+Se verifica que las muestras estén correctamente alineadas entre los distintos datasets (clínicos, 16S y metabolitos), comprobando que no falte ninguna ni existan discrepancias entre ellos.
+
+```{r comprobacion_ID_muestras}
+#Ver que las muestras son las mismas en todos los datasets
+muestras_dc <- unique(datos_clinicos$Sample)
+muestras_da16S <- unique(datos_abundancia_16S$Sample)
+muestras_dm <- unique(datos_metabolitos$Sample)
+
+c(
+  comunes = length(Reduce(intersect, list(muestras_dc, muestras_da16S, muestras_dm))),
+  solo_clinicos = length(setdiff(muestras_dc, union(muestras_da16S, muestras_dm))),
+  solo_16S = length(setdiff(muestras_da16S, union(muestras_dc, muestras_dm))),
+  solo_metabolitos = length(setdiff(muestras_dm, union(muestras_dc, muestras_da16S)))
+)
+```
+
+Con todos los resultados anteriores, se determina que los datasets están limpios.
+
+A través de la herramienta *summary* se realiza un análisis básico de los datasets. Empezando por los datos clínicos:
+
+```{r analisis_basico_dcm}
+library(dplyr)
+
+datos_clinicos_limpios <- datos_clinicos %>%
+  select(-ends_with("_0"))                    #Hay algunas variables repetidas "_0" / "_1
+
+#Me quedo con las muestras "_1"; más fácil de interpretar. Se reduce el nº de columnas.
+
+vars_id <- c("Sample")
+
+vars_num_clin <- datos_clinicos_limpios %>%
+  dplyr::select(-all_of(vars_id)) %>%
+  dplyr::select(where(is.numeric)) %>%
+  dplyr::select(where(~ n_distinct(., na.rm = TRUE) >= 0)) %>%
+  names()
+
+vars_cat_clin <- datos_clinicos_limpios %>%
+  dplyr::select(-all_of(vars_id)) %>%
+  dplyr::select(where(~ is.factor(.) | is.character(.))) %>%
+  dplyr::select(where(~ n_distinct(., na.rm = TRUE) >= 0)) %>%
+  names()
+
+cat("Variables clínicas numéricas:", length(vars_num_clin), "\n")
+cat("Variables clínicas categóricas:", length(vars_cat_clin), "\n")
+cat("Total de variables clínicas:", length(vars_num_clin) + length(vars_cat_clin), "\n")
+```
+Se identifica un total de 130 variables clínicas, de las que 35 son tipo de numéricas y 96 categóricas
+
+```{r datos_clinicos}
+summary(datos_clinicos_limpios)
+```
+
+A partir de este resumen de datos clínicos:
+
+- Diagnóstico (enfermedades): hay 12 controles, 14 muestras de VHC (Virus de la Hepatitis C), 8 muestras de HAI (Hepatitis autoinmune) y 12 muestras de CBP (Colangitis biliar primaria).
+
+- Sexo: las muestras son de 22 mujeres (47,83%) y 24 hombres (52,17%).
+
+- Se aprecian muchas variables de topografía, localización, células del sistema inmunitario (y otras variables de predominio de las mismas), morfología, fibrosis, fármacos y enfermedades. (0=NO, 1=SÍ). 
+
+
+Una vez analizado de forma básica el dataset de los datos clínicos, se exploran las características generales del dataset de metabolitos:
+
+```{r analisis_basico_dm}
+summary(datos_metabolitos)
+```
+
+Se contabilizan 53 metabolitos. La idea es ver los valores de cada metabolito en función de su enfermedad para comparar entre ellas. También usando sus medias se puede ver cuáles se expresan más y cuáles menos dentro de cada enfermedad.
+
+Cabe mencionar que las unidades de los mismos son abundancias relativas normalizadas derivadas de HPLC-MS/MS (unidades arbitrarias).
+
+Se combinan los datos clínicos con los datos de metabolitos para construir un único dataset integrado que permita realizar análisis conjuntos:
+
+```{r}
+datos_clinicos_metabolomicos <- merge(datos_clinicos_limpios, datos_metabolitos, by = "Sample")
+
+library(writexl)
+
+write_xlsx(datos_clinicos_metabolomicos, "datos_clinicos_metabolomicos.xlsx")
+```
+
+Una vez unidos los dataset, se realiza lo comentado (se calculan los valores mínimo, máximo y medio de cada metabolito agrupados por tipo de diagnóstico, con el objetivo de comparar patrones metabólicos entre enfermedades):
+
+```{r analisis_metabolitos}
+#Concentraciones mín., máx. y media de cada metabolito en cada enfermedad
+library(dplyr)
+library(reactable)
+metabolitos <- names(datos_metabolitos)[names(datos_metabolitos) != "Sample"]
+
+metabolitos_por_enfermedad <- datos_clinicos_metabolomicos %>%
+  group_by(diagnostico_principal) %>%
+  summarise(across(all_of(metabolitos),
+            
+            list(
+              minimo = ~min(.x, na.rm = TRUE),
+              maximo = ~max(.x, na.rm = TRUE),
+              media  = ~mean(.x, na.rm = TRUE)
+            ),
+            .names = "{.col}_{.fn}"
+  ))%>%
+  mutate(across(where(is.numeric), ~round(.x, 4)))
+reactable(metabolitos_por_enfermedad)
+```
+
+Una vez que se saben los valores medios, se ordenan los metabolitos según su concentración media dentro de cada enfermedad, con el fin de identificar cuáles presentan mayor y menor expresión relativa en cada grupo.
+
+```{r concentracion_media_metabolitos}
+#Ordenar los valores medios de cada metabolito por enfermedad de mayor a menor valor
+library(reactable)
+
+for (i in seq_len(nrow(metabolitos_por_enfermedad))) {
+
+  medias <- metabolitos_por_enfermedad[i, grep("_media$", names(metabolitos_por_enfermedad))]
+  medias <- as.numeric(medias)
+
+  metabolitos <- gsub("_media$", "", names(metabolitos_por_enfermedad)[grep("_media$", names(metabolitos_por_enfermedad))])
+
+  ord <- order(medias, decreasing = TRUE)
+
+  df <- data.frame(
+    metabolito = metabolitos[ord],
+    media = medias[ord]
+  )
+
+  cat("\n\n## PATHOLOGY:", metabolitos_por_enfermedad$diagnostico_principal[i], "\n")
+
+  print(
+    reactable(
+      df,
+      columns = list(
+        metabolito = colDef(name = "Metabolito"),
+        media = colDef(name = "Media", format = colFormat(digits = 4))
+      ),
+      sortable = TRUE,
+      filterable = FALSE,
+      highlight = TRUE,
+      compact = TRUE
+    )
+  )
+}
+```
+
+Seguidamente, se integran los datos de abundancia 16S con la información taxonómica, calculando posteriormente la abundancia relativa por muestra y agrupando los resultados a nivel de género.
+
+```{r union_datos_abundancia_metataxonomicos}
+library(tidyverse)
+library(writexl)
+
+#Poner el código de metataxonomía de la 1º columna estructural de DM como una columna normal("Codigo")
+datos_metatax_limpio <- datos_metataxonomicos %>%
+  rownames_to_column(var = "Codigo")
+
+#Unir (DM-AR16S) y calcular Abundancia Relativa ANTES de filtrar por >0
+datos_procesados_DM_AR16S <- datos_abundancia_16S %>%
+  #Paso a formato largo
+  pivot_longer(cols = -Sample, names_to = "Codigo", values_to = "Counts") %>%
+  #Unir con taxonomía
+  left_join(datos_metatax_limpio, by = "Codigo") %>%
+  # Filtro (Me quedo con >0 = Al menos 1 lectura)
+  filter(Counts > 0) %>%
+  #CÁLCULO ABUNDANCIA RELATIVA (%) 
+  group_by(Sample) %>%
+  mutate(Abundancia_Relativa = (Counts / sum(Counts)) * 100) %>%
+  ungroup()
+
+#Agrupar por Género (Aglomerar)
+#Como un mismo Género puede tener varios Códigos (OTUs), sumamos sus relativas
+datos_por_genero <- datos_procesados_DM_AR16S %>%
+  group_by(Sample, Genus) %>%
+  summarise(Abundancia_Relativa = sum(Abundancia_Relativa), .groups = "drop")
+
+#Excluir los Géneros vacíos 
+datos_abundancia_relativa_genero <- datos_por_genero %>%
+  filter(Genus != "")
+
+write_xlsx(datos_procesados_DM_AR16S, "datos_procesados_DM_AR16S.xlsx")
+write_xlsx(datos_abundancia_relativa_genero, "datos_abundancia_relativa_genero.xlsx")
+```
+
+Cabe destacar que la suma de las abundancias relativas de los diferentes Géneros pertenecientes a cada muestra no es del 100% porque se ha eliminado el % de abundancia relativa de aquellas muestras que no tenían un Género asociado. 
+
+Si se quiere determinar qué % de abundancia relativa se ha quitado por tener Género vacío:
+
+```{r Generos_vacios}
+porcentaje_eliminado_por_muestra <- datos_por_genero %>%
+  group_by(Sample) %>%
+  summarise(
+    Total_Abundancia = sum(Abundancia_Relativa),   
+    Generos_Vacios = sum(Abundancia_Relativa[Genus == ""]),
+    Porcentaje_Vacios = (Generos_Vacios / Total_Abundancia) * 100
+  )
+
+reactable(porcentaje_eliminado_por_muestra)
+
+#Total_Abundancia= Abundancia antes de aplicar cualquier filtro (incluye géneros con nombre y géneros vacíos).
+
+
+promedio_total_eliminado <- mean(porcentaje_eliminado_por_muestra$Porcentaje_Vacios)
+
+cat("Se ha eliminado un", promedio_total_eliminado, "% de la abundancia total por ser géneros vacíos.")
+```
+
+De esta forma, los géneros no asignados (vacíos) representan, en promedio, el 21,56% de la abundancia relativa total de metataxonomía estudiada. Por lo que, el análisis del TFM explica el 78,44% restante.
+
+
+# **Estadística descriptiva**
+
+Una vez realizado todo lo anterior y terminado el preprocesamiento, se generan tablas descriptivas de las variables clínicas, categóricas, numéricas y metabolitos, estratificadas por diagnóstico, con el objetivo de caracterizar los grupos de estudio:
+
+```{r estadisticos_descriptivos}
+library(gtsummary)
+library(dplyr)
+
+#Definir qué columnas son qué
+
+vars_id <- c("Sample", "diagnostico_principal")
+
+# Clínicas categóricas: factores o character con pocos niveles
+vars_cat <- datos_clinicos_metabolomicos %>%
+  select(-all_of(vars_id), -all_of(metabolitos)) %>%
+  select(where(~ is.factor(.) | is.character(.))) %>%
+  select(where(~ n_distinct(., na.rm = TRUE) >= 2)) %>%   # elimina constantes
+  names()
+
+# Clínicas numéricas: numéricas que NO son metabolitos
+vars_num <- datos_clinicos_metabolomicos %>%
+  select(-all_of(vars_id), -all_of(metabolitos)) %>%
+  select(where(is.numeric)) %>%
+  select(where(~ n_distinct(., na.rm = TRUE) >= 2)) %>%   # elimina constantes
+  names()
+
+# Metabolitos (definidos como metabolitos)
+
+# Tabla 1: Variables clínicas categóricas 
+tabla_cat <- datos_clinicos_metabolomicos %>%
+  select(diagnostico_principal, all_of(vars_cat)) %>%
+  tbl_summary(
+    by = diagnostico_principal,
+    statistic = all_categorical() ~ "{n} ({p}%)",
+    missing = "no"
+  ) %>%
+  add_overall() %>%
+  add_p() %>%
+  bold_p() %>%
+  bold_labels()
+
+# Tabla 2: Variables clínicas numéricas 
+tabla_num <- datos_clinicos_metabolomicos %>%
+  select(diagnostico_principal, all_of(vars_num)) %>%
+  tbl_summary(
+    by = diagnostico_principal,
+    statistic = all_continuous() ~ "{median} [{p25}, {p75}]",
+    missing = "no"
+  ) %>%
+  add_overall() %>%
+  add_p() %>%
+  bold_p() %>%
+  bold_labels()
+
+# Tabla 3: Metabolitos 
+tabla_metabolitos <- datos_clinicos_metabolomicos %>%
+  select(diagnostico_principal, all_of(metabolitos)) %>%
+  tbl_summary(
+    by = diagnostico_principal,
+    statistic = all_continuous() ~ "{median} [{p25}, {p75}]",
+    missing = "no"
+  ) %>%
+  add_overall() %>%
+  add_p() %>%
+  bold_p() %>%
+  bold_labels()
+
+tabla_cat
+tabla_num
+tabla_metabolitos
+
+```
+Los datos se presentan como n (%) para variables categóricas y como mediana [rango intercuartílico] para variables continuas. Las comparaciones entre grupos se realizaron mediante chi-cuadrado o Fisher exacto para categóricas, y Kruskal-Wallis para continuas, con corrección de Bonferroni para comparaciones múltiples.
+
+
+# **Estadística inferencial**
+
+Una vez realizado todo lo anterior, se continua con estadística inferencial de las variables para verificar la información que los han dado los estadísticos anteriores: se aplica una función de inferencia estadística que permite evaluar diferencias entre grupos de diagnóstico para variables categóricas y numéricas, utilizando pruebas como Chi-cuadrado, ANOVA o Kruskal-Wallis según corresponda. Ésta acepta un dataframe cuyas columnas son variables y filas observaciones de pacientes. La variable a comparar es *diagnostico_principal*.
+
+```{r estadistica_inferencial}
+library(tidyverse)
+library(DescTools) # Necesaria para DunnTest
+
+set.seed(123) # NECESARIA PARA NO VARIAR DATOS (sobre todo de MonteCarlo)
+
+estadisticas <- function(df, diagnostico_principal) {
+  library(tidyverse)
+  library(DescTools)
+  
+  df[[diagnostico_principal]] <- factor(df[[diagnostico_principal]])
+  df_statistics <- data.frame()
+  
+  # Filtramos solo columnas factor o numéricas, ignorando IDs
+  vars_a_testear <- names(df)[names(df) != diagnostico_principal]
+  
+  if (length(levels(df[[diagnostico_principal]])) >= 3) {
+    for (i in vars_a_testear) {
+      
+      # --- 1. CASO CATEGÓRICO (FACTOR) ---
+      if (is.factor(df[[i]]) | is.character(df[[i]])) {
+        df[[i]] <- factor(df[[i]])
+        tab <- table(df[[diagnostico_principal]], df[[i]])
+        
+        # Si la tabla está vacía o solo tiene una categoría, saltar
+        if (ncol(tab) < 2) next
+        
+        test <- tryCatch(chisq.test(tab), error = function(e) return(NULL))
+        if (is.null(test)) next
+        
+        if (any(test$expected < 5)) {
+          test <- chisq.test(tab, simulate.p.value = TRUE, B = 2000)
+          df_statistics[i, "Test"] <- "Chi2 Monte Carlo"
+        } else {
+          test <- chisq.test(tab) # Aseguramos que el test esté asignado
+          df_statistics[i, "Test"] <- "Chi2 test"
+        }
+        df_statistics[i, "p.value"] <- signif(test$p.value, 2)
+        
+        # BLOQUE AÑADIDO PARA EVITAR NAs EN CATEGÓRICAS
+        df_statistics[i, "p.signif"] <- case_when(
+          test$p.value <= 0.05 & test$p.value > 0.01 ~ "*",
+          test$p.value <= 0.01 & test$p.value > 0.001 ~ "**",
+          test$p.value <= 0.001 ~ "***",
+          TRUE ~ "-"
+        )
+        df_statistics[i, "posthoc"] <- "-"
+        df_statistics[i, "posthoc_pvalue"] <- "-"
+        
+      # --- 2. CASO NUMÉRICO (METABOLITOS) ---
+      } else if (is.numeric(df[[i]])) {
+        
+        # Comprobar si la variable es constante (varianza cero)
+        if (var(df[[i]], na.rm = TRUE) == 0) {
+          message(paste("Variable saltada (valores idénticos):", i))
+          next
+        }
+        
+        form <- as.formula(paste0("`", i, "` ~ ", diagnostico_principal))
+        fit <- aov(form, data = df)
+        
+        # TEST DE NORMALIDAD (con manejo de errores)
+        residuos <- residuals(fit)
+        if (all(residuos == residuos[1])) { next } # Salta si residuos son idénticos
+        
+        normalidad <- shapiro.test(residuos)
+        
+        if (normalidad$p.value < 0.05) {
+          test_glob <- kruskal.test(form, data = df)
+          df_statistics[i, "Test"] <- "Kruskal-Wallis"
+          p_val <- test_glob$p.value
+        } else {
+          df_statistics[i, "Test"] <- "Anova"
+          p_val <- summary(fit)[[1]][["Pr(>F)"]][1]
+        }
+        
+        df_statistics[i, "p.value"] <- signif(p_val, 2)
+        
+        # --- 3. POST-HOC (SI P < 0.05) ---
+        if (p_val <= 0.05) {
+          df_statistics[i, "p.signif"] <- case_when(
+            p_val <= 0.05 & p_val > 0.01 ~ "*",
+            p_val <= 0.01 & p_val > 0.001 ~ "**",
+            p_val <= 0.001 ~ "***"
+          )
+          
+          if (df_statistics[i, "Test"] == "Kruskal-Wallis") {
+            ph <- DunnTest(form, data = df, method = "fdr")
+            ph_df <- as.data.frame(ph[1]) %>% rownames_to_column("c") %>% filter(.[,2] <= 0.05)
+            df_statistics[i, "posthoc"] <- "Dunn (FDR)"
+          } else {
+            ph <- TukeyHSD(fit)
+            ph_df <- as.data.frame(ph[[diagnostico_principal]]) %>% rownames_to_column("c") %>% filter(.[,5] <= 0.05)
+            df_statistics[i, "posthoc"] <- "Tukey HSD"
+          }
+          
+          df_statistics[i, "posthoc_pvalue"] <- if(nrow(ph_df)>0) paste(ph_df$c, collapse=", ") else "-"
+        } else {
+          df_statistics[i, "p.signif"] <- "-"
+          df_statistics[i, "posthoc"] <- "-"
+          df_statistics[i, "posthoc_pvalue"] <- "-"
+        }
+      }
+    }
+  }
+  return(df_statistics %>% rownames_to_column("Variable"))
+}
+
+# Variables clínicas
+cols_clinicas <- c("diagnostico_principal", vars_cat, vars_num)
+estadistica_inferencial_clinica <- estadisticas(
+  datos_clinicos_metabolomicos[, cols_clinicas],
+  "diagnostico_principal"
+)
+
+# Metabolitos
+cols_metabolitos <- c("diagnostico_principal", metabolitos)
+estadistica_inferencial_metabolitos <- estadisticas(
+  datos_clinicos_metabolomicos[, cols_metabolitos],
+  "diagnostico_principal"
+)
+
+# Resultados
+view(estadistica_inferencial_clinica)
+view(estadistica_inferencial_metabolitos)
+
+
+write_xlsx(
+  list(
+    clinica     = estadistica_inferencial_clinica,
+    metabolitos = estadistica_inferencial_metabolitos
+  ),
+  "estadistica_inferencial.xlsx"
+)
+```
+
+
+En el dataset **datos_clinicos_metabolomicos** hay 184 variables (sin contar *Sample*), tras aplicarle la función de estadística inferencial salen 171. Esto es porque los test se hacen sobre las variables que tienen resultados de varios tipos (ya sean 2,3 o +, pero siempre >1) por eso se han quitado 12 variables clínicas que tenían solo resultados únicos (todos =0 o todos =1) y, por supuesto, la variable *diagnostico_principal* junto con *Sample*, ya que este último es un identificador único para cada muestra (un nombre distinto para cada fila) y el test de Chi-cuadrado intenta buscar patrones donde no los hay.
+
+
+Se filtran los resultados estadísticos para identificar únicamente aquellas variables con significación estadística, tanto en datos clínicos como en metabolitos:
+
+```{r estadistica_inferencial_significativos}
+# Significativos clínica
+clinica_signif <- estadistica_inferencial_clinica %>%
+  filter(p.signif != "-") %>%
+  arrange(p.value)
+
+reactable(clinica_signif)
+
+# Significativos metabolitos
+metabolitos_signif <- estadistica_inferencial_metabolitos %>%
+  filter(p.signif != "-") %>%
+  arrange(p.value)
+
+reactable(metabolitos_signif)
+```
+
+De los 172 estadísticos realizados, 68 son significativos (38 de variables clínicas y 30 metabolitos).
+
+Se agrupan los metabolitos significativos según el grupo de diagnóstico, preparando los datos para su posterior análisis funcional en MetaboAnalyst, donde se puede hacer un enriquecimiento de los metabolitos para ver las rutas y términos enriquecidos. También se puede enlazar con bases de datos de bacterias.
+
+```{r metablitos_significativos_por_enfermedad_metaboAnalyst}
+#Se realiza corrección de nombres porque si no MetaboAnalyst no trabaja bien
+library(tidyverse)
+
+# 2. Pasar a formato long (separar múltiples comparaciones)
+metabolitos_signif_posthoc_pvalue_separados <- metabolitos_signif %>%
+  filter(posthoc_pvalue != "-", !is.na(posthoc_pvalue)) %>%
+  separate_rows(posthoc_pvalue, sep = ",\\s*") %>%
+  mutate(posthoc_pvalue = str_trim(posthoc_pvalue))
+
+# 3. Función de limpieza de nombres para que no dé error en MetaboAnalyst
+clean_metabolites <- function(x) {
+  x %>%
+    tolower() %>%
+    str_replace_all("^x[0-9]+[ _-]", "") %>%
+    str_replace_all("_neg|_pos", "") %>%
+    str_replace_all("_", " ") %>%
+    str_squish()
+}
+
+# 4. Crear listas por enfermedad/Control
+Healthy_metabolites <- metabolitos_signif_posthoc_pvalue_separados %>%
+  filter(str_detect(posthoc_pvalue, "Healthy")) %>%
+  pull(Variable) %>%
+  unique() %>%
+  clean_metabolites()
+
+HAI_metabolites <- metabolitos_signif_posthoc_pvalue_separados %>%
+  filter(str_detect(posthoc_pvalue, "HAI")) %>%
+  pull(Variable) %>%
+  unique() %>%
+  clean_metabolites()
+
+VHC_metabolites <- metabolitos_signif_posthoc_pvalue_separados %>%
+  filter(str_detect(posthoc_pvalue, "VHC")) %>%
+  pull(Variable) %>%
+  unique() %>%
+  clean_metabolites()
+
+CBP_metabolites <- metabolitos_signif_posthoc_pvalue_separados %>%
+  filter(str_detect(posthoc_pvalue, "CBP")) %>%
+  pull(Variable) %>%
+  unique() %>%
+  clean_metabolites()
+
+writeLines(HAI_metabolites, "HAI_metabolites.txt")
+writeLines(VHC_metabolites, "VHC_metabolites.txt")
+writeLines(CBP_metabolites, "CBP_metabolites.txt")
+writeLines(Healthy_metabolites, "Healthy_metabolites.txt")
+```
+
+# **Representaciones gráficas**
+
+Se realizan representaciones gráficas de las variables más significativas. Para ello,  se define una función auxiliar que permite extraer los *pares significativos del post-hoc* realizado anteriormente en estadistica inferencial, facilitando su uso en las representaciones gráficas.
+
+```{r}
+library(ggpubr)
+library(tidyverse)
+
+# La columna "posthoc_pvalue" tiene formato "Control-VHC, Control-HAI"
+extraer_comparaciones <- function(posthoc_str) {
+  if (is.na(posthoc_str) || posthoc_str == "-") return(NULL)
+  pares <- strsplit(posthoc_str, ", ")[[1]]
+  lapply(pares, function(p) strsplit(p, "-")[[1]])
+}
+
+# Paleta de colores consistente en todos los gráficos
+paleta <- c("CBP" = "#E41A1C", "Healthy" = "#4DAF4A",
+            "HAI" = "#377EB8", "VHC"     = "#FF7F00")
+```
+
+
+## A) Distribución de pacientes por diagnóstico
+
+Se representa el número de pacientes en cada grupo diagnóstico, con el objetivo de visualizar el balance de la muestra.
+
+```{r pacientes_diagnostico}
+ggplot(datos_clinicos_metabolomicos, aes(x = diagnostico_principal, fill = diagnostico_principal)) +
+  geom_bar(color = "white", width = 0.7) +
+  scale_fill_manual(values = paleta) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme_pubr() +
+  labs(title = "Número de pacientes por diagnóstico",
+       x = "Diagnóstico principal", y = "Número de pacientes") +
+  theme(legend.position = "none")
+```
+
+El gráfico representa el **volumen total de la muestra** distribuido en las 4 categorías de diagnóstico principal. El grupo con mayor cantidad de individuos es el de pacientes con **VHC** (14), seguido por un empate entre el grupo de control **Healthy** y los pacientes con **CBP** (12 cada uno), mientras que la condición de **HAI** registra la menor representación con 8 pacientes.
+
+
+## B) Distribución del sexo por grupos de diagnóstico
+
+Se analiza la distribución del sexo dentro de cada grupo diagnóstico, tanto en términos absolutos como relativos.
+
+```{r distribucion_sexo}
+library(ggplot2)
+library(scales)
+
+#Con nº de pacientes
+ggplot(datos_clinicos_metabolomicos, aes(x = diagnostico_principal, fill = genero)) +
+  geom_bar(position = "dodge", color = "white", width = 0.7) +
+  scale_fill_manual(values = c("M" = "#5DADE2", "F" = "#EC7063"),
+                    labels = c("M" = "Hombre", "F" = "Mujer")) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 5)) +
+  theme_pubr() +
+  labs(title = "Distribución de sexo por diagnóstico",
+       x = "Diagnóstico principal", y = "Número de pacientes", fill = "Sexo")
+
+#Con porcentajes
+ggplot(datos_clinicos_metabolomicos,
+       aes(x = diagnostico_principal, fill = genero)) +
+  
+  geom_bar(position = "fill", color = "white", width = 0.7) +
+  
+  scale_fill_manual(values = c("M" = "#5DADE2", "F" = "#EC7063"),
+                    labels = c("M" = "Hombre", "F" = "Mujer")) +
+  
+  scale_y_continuous(labels = scales::percent_format()) +
+  
+  theme_pubr() +
+  
+  labs(title = "Distribución porcentual de sexo por diagnóstico",
+       x = "Diagnóstico principal",
+       y = "Porcentaje",
+       fill = "Sexo")
+```
+
+El gráfico muestra la distribución de pacientes por sexo (hombres en azul y mujeres en rojo) según cuatro diagnósticos principales: Healthy, VHC, HAI y CBP. Se observa un claro predominio de **hombres** en el grupo con diagnóstico de **VHC** (12 hombres - 1 mujer) y, de forma más equilibrada, en el grupo control. Por el contrario, las enfermedades autoinmunes muestran una marcada prevalencia en **mujeres**, destacando especialmente en **HAI** (7 mujeres - 1 hombre) y en **CBP** (8 mujeres - 4 hombres).
+
+
+## C) Distribución de la edad por grupos de diagnóstico (con p-valor global y comparaciones pareadas)
+
+Se representa la distribución de la edad entre los distintos grupos diagnósticos.
+
+```{r distribucion_edad}
+# Extraer comparaciones significativas para edad desde tu tabla inferencial
+comp_edad <- estadistica_inferencial_clinica %>%
+  filter(Variable == "idade") %>%
+  pull(posthoc_pvalue) %>%
+  extraer_comparaciones()
+
+p_edad <- ggboxplot(datos_clinicos_metabolomicos,
+                    x = "diagnostico_principal", y = "idade",
+                    fill = "diagnostico_principal",
+                    color = "diagnostico_principal",
+                    palette = paleta,
+                    add = "jitter", add.params = list(alpha = 0.4, size = 1.5)) +
+  stat_compare_means(method = "kruskal.test",
+                     label.y = max(datos_clinicos_metabolomicos$idade, na.rm = TRUE) * 1.15) +
+  { if (!is.null(comp_edad))
+    stat_compare_means(comparisons = comp_edad,
+                       method = "wilcox.test",
+                       label = "p.signif",
+                       hide.ns = TRUE) } +
+  theme_pubr() +
+  labs(title = "Distribución de la edad por diagnóstico",
+       x = "Diagnóstico", y = "Edad (años)") +
+  theme(legend.position = "none")
+
+p_edad
+```
+
+El gráfico muestra que las medianas de edad son bastante similares entre los cuatro grupos diagnósticos (entre 50 y 60 años), siendo el grupo de **CBP** el que presenta la mayor dispersión y variabilidad de edades. Estadísticamente, el valor de **p = 0.79** obtenido mediante la prueba de **Kruskal-Wallis** (>0.05) demuestra que **no existen diferencias significativas** en la distribución de la edad entre los diferentes grupos, lo que confirma que las cohortes están correctamente homogeneizadas o balanceadas respecto a esta variable.
+
+
+## D) TOP 10 metabolitos mas significativos en cada enfermedad (función reutilizable con ggpubr)
+
+Se visualizan los 10 metabolitos más significativos entre grupos diagnósticos mediante representaciones tipo boxplot con comparaciones estadísticas.
+
+```{r 10_metabolitos_mas_significativos, fig.width = 16, fig.height = 8}
+
+top_metabolitos <- metabolitos_signif %>%
+  slice_head(n = 10) %>%
+  pull(Variable)
+
+plots_metabolitos <- lapply(top_metabolitos, function(met) {
+  
+  comp <- estadistica_inferencial_metabolitos %>%
+    filter(Variable == met) %>%
+    pull(posthoc_pvalue) %>%
+    extraer_comparaciones()
+  
+  p_glob <- estadistica_inferencial_metabolitos %>%
+    filter(Variable == met) %>%
+    pull(p.value)
+  
+  y_max <- max(datos_clinicos_metabolomicos[[met]], na.rm = TRUE)
+  
+  g <- ggboxplot(datos_clinicos_metabolomicos,
+                 x = "diagnostico_principal",
+                 y = met,
+                 fill = "diagnostico_principal",
+                 color = "diagnostico_principal",
+                 palette = paleta,
+                 add = "jitter",
+                 add.params = list(alpha = 0.3, size = 1)) +
+    stat_compare_means(method = "kruskal.test",
+                       label.y = y_max * 1.2,
+                       size = 3) +
+    { if (!is.null(comp))
+      stat_compare_means(comparisons = comp,
+                         method = "wilcox.test",
+                         label = "p.signif",
+                         hide.ns = TRUE) } +
+    theme_pubr(base_size = 9) +
+    labs(title = met, x = NULL, y = "Intensidad") +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  return(g)
+})
+
+# Montar en una sola figura (2 filas × 5 columnas)
+ggarrange(plotlist = plots_metabolitos,
+          ncol = 5, nrow = 2,
+          common.legend = TRUE, legend = "bottom")
+```
+
+Los niveles de intensidad de los 10 metabolitos más significativos varían de forma significativa entre los grupos diagnósticos (todos con p < 0.05 en la prueba global Kruskal-Wallis). Se observan perfiles biomarcadores diferenciados para cada patología: por ejemplo, *HAI* destaca por niveles elevados de *uric_acid* y *arginine*, y por una reducción drástica de *imidazole*. Por su parte, *VHC* se caracteriza por un incremento marcado en metabolitos como *x2_isopropylmalic_acid*, *methylmalonic_acid*, *succinate* y *orotate*, mientras que *CBP* exhibe la mayor intensidad en *imidazole* y *x1_methyladenosine*. Las comparaciones post-hoc (indicadas con los asteriscos *) confirman qué grupos específicos sostienen estas diferencias biológicas frente al grupo control sano o entre las propias hepatopatías.
+
+
+## E) TOP 10 variables clínicas numéricas mas significativas en cada enfermedad (función reutilizable con ggpubr)
+
+Se representan las 10 variables clínicas numéricas más significativas entre grupos diagnósticos mediante boxplots con análisis estadístico asociado.
+
+```{r 10_vclinicas_numericas_mas_significativas, fig.width = 16, fig.height = 7}
+top_clinicas_num <- clinica_signif %>%
+  filter(Variable %in% vars_num) %>%
+  slice_head(n = 10) %>%
+  pull(Variable)
+
+plots_clinicas_num <- lapply(top_clinicas_num, function(var) {
+  
+  comp <- estadistica_inferencial_clinica %>%
+    filter(Variable == var) %>%
+    pull(posthoc_pvalue) %>%
+    extraer_comparaciones()
+  
+  y_max <- max(datos_clinicos_metabolomicos[[var]], na.rm = TRUE)
+  
+  g <- ggboxplot(datos_clinicos_metabolomicos,
+                 x = "diagnostico_principal",
+                 y = var,
+                 fill = "diagnostico_principal",
+                 color = "diagnostico_principal",
+                 palette = paleta,
+                 add = "jitter",
+                 add.params = list(alpha = 0.3, size = 1)) +
+    stat_compare_means(method = "kruskal.test",
+                       label.y = y_max * 1.2,
+                       size = 3) +
+    { if (!is.null(comp))
+      stat_compare_means(comparisons = comp,
+                         method = "wilcox.test",
+                         label = "p.signif",
+                         hide.ns = TRUE) } +
+    theme_pubr(base_size = 9) +
+    labs(title = var, x = NULL, y = NULL) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  return(g)
+})
+
+ggarrange(plotlist = plots_clinicas_num,
+          ncol = 5, nrow = 2,
+          common.legend = TRUE, legend = "bottom")
+```
+
+Este gráfico muestra las 10 variables clínicas numéricas con diferencias más significativas entre los grupos (p < 0.05). El grupo **CBP** destaca por una alteración en la coagulación con mayores niveles de **tempo_de_protrombina** e **inr**, además de picos elevados en la enzima hepática **alt** y en **comprimento_da_biopsia_mm**. El grupo **VHC** se diferencia principalmente en parámetros estructurales y de la biopsia como **a2_inicial_mm2** (área final), **media_a1_a2** y **a1_final_mm2** (área inicial). Por último, el grupo **HAI** muestra su rasgo más distintivo en el perfil inmunológico con una elevación notable de **eosinofilos_2**.
+
+## F) TOP 10 variables clinicas categoricas mas significativas en cada enfermedad (función reutilizable con ggpubr)
+
+Se visualizan las variables clínicas categóricas más relevantes mediante gráficos de barras apiladas, mostrando la distribución por diagnóstico.
+
+```{r 10_vclinicas_categoricas_mas_significativas}
+# Para categóricas ggpubr no añade comparaciones pareadas igual, así que mantengo barras apiladas con el p-valor global encima
+
+top_clinicas_cat <- clinica_signif %>%
+  filter(Variable %in% vars_cat) %>%
+  slice_head(n = 10) %>%
+  pull(Variable)
+
+datos_clinicos_metabolomicos %>%
+  select(diagnostico_principal, all_of(top_clinicas_cat)) %>%
+  pivot_longer(-diagnostico_principal, names_to = "Variable", values_to = "Categoria") %>%
+  ggplot(aes(x = diagnostico_principal, fill = Categoria)) +
+  geom_bar(position = "fill", color = "white") +
+  facet_wrap(~ Variable, ncol = 5) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_pubr(base_size = 9) +
+  labs(title = "Top 10 variables categóricas significativas",
+       x = NULL, y = "Proporción (%)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+El gráfico de barras apiladas revela perfiles clínico-patológicos altamente diferenciados: el grupo **HAI** se asocia de forma casi exclusiva a la positividad para **ama_1** (anticuerpos antimitocondriales), a una alta tasa de **ana_1** (anticuerpos antinucleares) y al uso de **udca_antes_de_biopsia_1**; el grupo **VHC** se caracteriza de forma inequívoca por la positividad para **anti_vhc_1**, la presencia absoluta de **plasmocitos_em_ep_1** y el predominio masculino; mientras que el grupo **CBP** comparte con HAI la prevalencia del género femenino y exhibe una elevada frecuencia de **ana_1** y **plasmocitos_em_ep_1**.

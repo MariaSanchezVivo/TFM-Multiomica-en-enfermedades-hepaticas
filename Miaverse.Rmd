@@ -1,0 +1,498 @@
+---
+title: "Exploración de la diversidad metataxonómica"
+author: "María Sánchez Vivo"
+date: "2026-05-22"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# **Introducción**
+
+En este script se realiza un análisis exploratorio de los datos metataxonómicos obtenidos mediante secuenciación 16S utilizando herramientas del ecosistema *Miaverse*. Para ello, se integran los datos de abundancia, taxonomía y clínicos en un objeto **TreeSummarizedExperiment**. Posteriormente, se analizan métricas de *alfa y beta diversidad* para explorar la diversidad que hay en nuestros datos metataxonomicos entre grupos diagnósticos, empleando índices de riqueza, diversidad y distintas medidas de distancia. Además, se aplican técnicas de reducción de dimensionalidad, como PCoA y UMAP, y se representan los géneros bacterianos más abundantes para explorar la composición de la microbiota en las muestras estudiadas.
+
+```{r librerías_datos}
+library(mia)
+library(miaViz)
+library(tidyverse)
+library(ggpubr)
+library(vegan)
+library(scater)
+
+# Carga de datos
+datos_metabolitos <- readRDS("metabolitos.rds")
+datos_metataxonomicos <- readRDS("tax.rds")
+datos_clinicos <- readRDS("covs.rds")
+datos_abundancia_16S <- readRDS("metagen.rds")
+```
+
+Para trabajar con el ecosistema *Miaverse*, es necesario construir un objeto **TreeSummarizedExperiment**, integrando la información de abundancias, taxonomía y variables clínicas en una única estructura de datos.
+
+```{r}
+# CONSTRUCCIÓN DEL TSE
+counts_prepared <- datos_abundancia_16S %>%
+  column_to_rownames("Sample") %>%
+  t() %>%
+  as.matrix()
+
+colnames(counts_prepared) <- trimws(colnames(counts_prepared))
+
+datos_clinicos_mia <- as.data.frame(datos_clinicos)
+rownames(datos_clinicos_mia) <- trimws(as.character(datos_clinicos_mia$Sample))
+
+tax_prepared <- datos_metataxonomicos %>%
+  as.data.frame() %>%
+  as.matrix()
+rownames(tax_prepared) <- trimws(rownames(tax_prepared))
+
+comun_muestras <- intersect(colnames(counts_prepared), rownames(datos_clinicos_mia))
+counts_filtrado <- counts_prepared[, comun_muestras]
+clinicos_final  <- datos_clinicos_mia[comun_muestras, ]
+
+comun_taxones <- intersect(rownames(counts_filtrado), rownames(tax_prepared))
+counts_final  <- counts_filtrado[comun_taxones, ]
+tax_final     <- tax_prepared[comun_taxones, ]
+
+tse <- TreeSummarizedExperiment(
+  assays  = list(counts = as.matrix(counts_final)),
+  colData = DataFrame(clinicos_final),
+  rowData = DataFrame(tax_final)
+)
+
+tse <- transformAssay(tse, method = "relabundance")
+```
+
+
+# **Alpha diversidad**
+
+En este apartado se calculan distintos índices de riqueza, diversidad, dominancia y equitatividad con el objetivo de evaluar la variabilidad microbiana dentro de cada muestra (*alpha diversidad*) y comparar los grupos diagnósticos.
+
+```{r alpha_diversidad}
+tse <- estimateDiversity(tse, assay.type = "counts",
+                         index = c("shannon", "gini_simpson",
+                                   "inverse_simpson", "fisher",
+                                   "log_modulo_skewness"))
+
+tse <- estimateRichness(tse, assay.type = "counts",
+                        index = c("observed", "chao1", "ace"))
+
+tse <- estimateDominance(tse, assay.type = "counts",
+                         index = c("absolute", "relative",
+                                   "gini", "dmn", "dbp", "simpson_lambda"))
+
+tse <- estimateEvenness(tse, assay.type = "counts",
+                        index = c("pielou", "simpson",
+                                  "camargo", "evar", "bulla"))
+
+
+df_alpha <- as.data.frame(colData(tse))
+
+df_alpha$diagnostico_principal <- factor(df_alpha$diagnostico_principal)
+
+niveles_dx <- levels(df_alpha$diagnostico_principal)
+
+paleta_dx <- c("CBP"="#E41A1C","Healthy"="#4DAF4A",
+               "HAI"="#377EB8","VHC"="#FF7F00")
+
+todas_comparaciones <- combn(niveles_dx, 2, simplify=FALSE)
+
+
+#FUNCIÓN DE PLOTS
+plot_alpha <- function(indice, df, grupo="diagnostico_principal") {
+  
+  if (!indice %in% colnames(df)) return(NULL)
+  
+  val_max <- max(df[[indice]], na.rm = TRUE)
+  
+  ggboxplot(df,
+            x=grupo,
+            y=indice,
+            fill=grupo,
+            add="jitter",
+            add.params=list(alpha=0.4, size=1.5)) +
+    scale_fill_manual(values=paleta_dx) +
+    
+    stat_compare_means(method="kruskal.test",
+                       label="p.format",
+                       label.y = val_max * 1.05) + 
+    
+    stat_compare_means(comparisons=todas_comparaciones,
+                       method="wilcox.test",
+                       label="p.signif",
+                       hide.ns=TRUE) +
+    theme_pubr(base_size=9) +
+    theme(axis.text.x=element_text(angle=45, hjust=1),
+          legend.position="none") +
+    labs(title=indice, x=NULL, y=NULL) +
+
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.25)))
+}
+
+
+#RIQUEZA: Cuenta el número total de OTUs de cada muestra
+ggarrange(
+  plotlist = Filter(Negate(is.null),
+                    lapply(c("observed","chao1","ace"),
+                           plot_alpha, df=df_alpha)),
+  ncol=3,nrow=1
+) %>%
+  annotate_figure(top=text_grob("Riqueza",face="bold",size=13))
+
+
+#DIVERSIDAD: mide cuántos OTUs hay y cómo se distribuyen sus abundancias dentro de cada muestra
+ggarrange(
+  plotlist = Filter(Negate(is.null),
+                    lapply(c("shannon","gini_simpson","inverse_simpson",
+                             "fisher","log_modulo_skewness"),
+                           plot_alpha, df=df_alpha)),
+  ncol=3,nrow=2
+) %>%
+  annotate_figure(top=text_grob("Diversidad",face="bold",size=13))
+
+
+#DOMINANCIA: mide si unas pocas OTUs concentran la mayor parte de la abundancia en la muestra
+ggarrange(
+  plotlist = Filter(Negate(is.null),
+                    lapply(c("absolute","relative","gini",
+                             "dmn","dbp","simpson_lambda"),
+                           plot_alpha, df=df_alpha)),
+  ncol=3,nrow=2
+) %>%
+  annotate_figure(top=text_grob("Dominancia",face="bold",size=13))
+
+
+#EQUITATIVIDAD: mide si todos los OTUs tienen abundancias parecidas
+ggarrange(
+  plotlist = Filter(Negate(is.null),
+                    lapply(c("pielou","simpson","camargo",
+                             "evar","bulla"),
+                           plot_alpha, df=df_alpha)),
+  ncol=3,nrow=2
+) %>%
+  annotate_figure(top=text_grob("Equitatividad",face="bold",size=13))
+
+```
+
+- **RIQUEZA**: Los tres estimadores utilizados muestran un comportamiento idéntico, lo que confirma una óptima profundidad de secuenciación. Estadísticamente, el valor de p = 0.29 demuestra que **no existen diferencias significativas** en la riqueza de la alfa diversidad entre los grupos diagnóstico; aunque visualmente el grupo **VHC** tiende a mostrar una mediana sutilmente mayor y el grupo **HAI** una menor. La alta variabilidad interna de las muestras hace que la cantidad de taxones presentes en la microbiota sea homogénea entre pacientes sanos y con las distintas hepatopatías.
+
+- **DIVERSIDAD**: Se evalúa la **diversidad general** de la alfa diversidad mediante cinco índices diferentes, los cuales miden tanto la riqueza de especies como la uniformidad de su abundancia. Las pruebas estadísticas globales demuestran de forma contundente que **no existen diferencias globales significativas** en la estructura de la microbiota entre los cuatro grupos de estudio (p>0.05). La única excepción puntual una pequeña diferencia estadísticamente significativa (marcada con un asterisco `*` en los índices de Simpson) entre el grupo **VHC**, que tiende a mostrar la diversidad y uniformidad más alta, y el grupo **CBP**, que exhibe los niveles más bajos y una menor homogeneidad en su comunidad bacteriana.
+
+- **DOMINANCIA**: Las pruebas estadísticas globales confirman que **no existen diferencias globales significativas** (p>0.05) en la dominancia de la microbiota intestinal entre los grupos. Sin embargo, los índices **relative, dbp** y **simpson_lambda** revelan una diferencia local significativa (asterisco `*`) entre **VHC** y  **CBP**, lo que demuestra que los pacientes con CBP tienen una dominancia significativamente mayor (un ecosistema más monopolizado por ciertas bacterias), mientras que el grupo VHC presenta comunidades más equitativas y menos dominadas por taxones individuales.
+
+- **EQUITATIVIDAD**: Los altos valores de p obtenidos en todas las pruebas globales (p>0.5) demuestran que **no existe ninguna diferencia estadísticamente significativa** entre los grupos estudiados. A diferencia de gráficos, aquí no se observa ningún `*`, lo que confirma que la homogeneidad y el equilibrio en el reparto de las poblaciones bacterianas es equivalente entre individuos sanos y pacientes con VHC, HAI o CBP.
+
+
+
+# **Beta diversidad**
+
+## Disimilitud de Brays-Curtis
+
+La *beta diversidad* es la comparación entre diferentes muestras (si son parecidas o diferentes) y se evalúa en este apartado utilizando la *distancia Bray-Curtis sobre abundancias relativas*, representando las diferencias entre muestras mediante un análisis PCoA y validándolas con PERMANOVA.
+
+```{r beta_diversidad-Bray_Curtis}
+library(mia)
+library(scater)
+library(vegan)
+library(ggplot2)
+library(ggpubr)
+
+# Transformar a abundancia relativa
+tse_bray <- transformAssay(
+  tse,
+  method = "relabundance"
+)
+
+# Calcular PCoA con Bray-Curtis
+tse_bray <- runMDS(
+  tse_bray,
+  FUN = vegan::vegdist,
+  method = "bray",
+  assay.type = "relabundance",
+  name = "PCoA_bray"
+)
+
+# Calcular matriz de distancia Bray-Curtis
+dist_bray <- vegdist(
+  t(assay(tse_bray, "relabundance")),
+  method = "bray"
+)
+
+# PERMANOVA
+set.seed(123)
+
+perm <- adonis2(
+  dist_bray ~ diagnostico_principal,
+  data = as.data.frame(colData(tse_bray)),
+  permutations = 999
+)
+
+# Extraer estadísticas
+fval <- perm$F[1]
+r2 <- perm$R2[1]
+pval <- perm$`Pr(>F)`[1]
+
+# Crear subtítulo
+subtitulo <- sprintf(
+  "PERMANOVA: F = %.2f | R² = %.3f | p = %.3g",
+  fval,
+  r2,
+  pval
+)
+
+# Generar gráfico
+p_bray <- plotReducedDim(
+  tse_bray,
+  "PCoA_bray",
+  colour_by = "diagnostico_principal",
+  point_size = 3
+)
+
+# Plot final
+p_bray +
+  scale_color_manual(values = paleta_dx) +
+  theme_pubr() +
+  labs(
+    title = "PCoA Bray-Curtis (relabundance)",
+    subtitle = subtitulo,
+    color = "Diagnóstico"
+  )
+```
+
+Tanto el **PCoA de Bray-Curtis** como la prueba matemática de **PERMANOVA** (*adonis2*) demuestran de forma contundente que **no existen diferencias significativas** en la composición global de la microbiota entre los grupos (p = 0.318). El diagnóstico principal solo explica el **7.3%** de la variabilidad de las comunidades bacterianas (R^2 = 0.073), dejando el 92.7% restante a la propia variabilidad interindividual. Esto se refleja visualmente en el gráfico, donde los puntos de las diferentes condiciones aparecen completamente dispersos y solapados entre sí, sin formar agrupaciones independientes.
+
+
+## Distancia Jaccard
+
+Posteriormente, se realiza un análisis basado en la *distancia Jaccard*, utilizando datos de presencia/ausencia para estudiar diferencias composicionales entre grupos diagnósticos.
+
+```{r beta_diversidad-Jaccard}
+# Transformación a presence/absence
+tse_pa <- transformAssay(
+  tse,
+  method = "pa"
+)
+
+# PCoA con distancia Jaccard
+tse_pa <- runMDS(
+  tse_pa,
+  FUN = vegan::vegdist,
+  method = "jaccard",
+  assay.type = "pa",
+  name = "PCoA_jaccard"
+)
+
+# Matriz de distancia Jaccard
+dist_jaccard <- vegdist(
+  t(assay(tse_pa, "pa")),
+  method = "jaccard",
+  binary = TRUE
+)
+
+# PERMANOVA
+set.seed(123)
+
+perm <- adonis2(
+  dist_jaccard ~ diagnostico_principal,
+  data = as.data.frame(colData(tse_pa)),
+  permutations = 999
+)
+
+# Extraer estadísticos
+fval <- perm$F[1]
+r2 <- perm$R2[1]
+pval <- perm$`Pr(>F)`[1]
+
+# Subtítulo
+subtitulo <- sprintf(
+  "PERMANOVA: F = %.2f | R² = %.3f | p = %.3g",
+  fval,
+  r2,
+  pval
+)
+
+# Plot
+p_jaccard <- plotReducedDim(
+  tse_pa,
+  "PCoA_jaccard",
+  colour_by = "diagnostico_principal",
+  point_size = 3
+)
+
+# Figura final
+p_jaccard +
+  scale_color_manual(values = paleta_dx) +
+  theme_pubr() +
+  labs(
+    title = "PCoA Jaccard (presence/absence)",
+    subtitle = subtitulo,
+    color = "Diagnóstico"
+  )
+
+```
+
+El **PCoA** basado en la distancia de **Jaccard** evalúa la beta diversidad centrándose exclusivamente en la **presencia o ausencia** de taxones bacterianos, ignorando sus abundancias relativas. Los resultados de la prueba de **PERMANOVA** (*adonis2*) determinan que **no existen diferencias estadísticas significativas** en la composición cualitativa de la microbiota entre los grupos (p = 0.189). Similar al análisis anterior, el diagnóstico principal solo explica el **7.0%** de la varianza total (R^2 = 0.070), por lo que el 93% se debe a la variabilidad interindividual de los pacientes. Es por ello que en el gráfico bidimensional las muestras de todos los grupos no muestran ningún patrón de agrupación, es decir, no hay diferencias entre grupos.
+
+
+## Distancia de Aitchison
+
+Dado que los datos microbiológicos son composicionales, también se aplica una *transformación CLR y la distancia de Aitchison*, considerada una aproximación adecuada para este tipo de datos.
+
+```{r beta_diversidad-Aitchison}
+# Transformación CLR
+tse_clr <- transformAssay(
+  tse,
+  method = "clr",
+  pseudocount = 1
+)
+
+# PCoA / MDS con distancia euclídea (Aitchison)
+tse_clr <- runMDS(
+  tse_clr,
+  FUN = stats::dist,
+  method = "euclidean",
+  assay.type = "clr",
+  name = "PCoA_aitchison"
+)
+
+# Distancia Aitchison
+dist_aitchison <- dist(
+  t(assay(tse_clr, "clr")),
+  method = "euclidean"
+)
+
+# PERMANOVA
+set.seed(123)
+
+perm <- adonis2(
+  dist_aitchison ~ diagnostico_principal,
+  data = as.data.frame(colData(tse_clr)),
+  permutations = 999
+)
+
+# Extraer estadísticos
+fval <- perm$F[1]
+r2 <- perm$R2[1]
+pval <- perm$`Pr(>F)`[1]
+
+# Subtítulo
+subtitulo <- sprintf(
+  "PERMANOVA: F = %.2f | R² = %.3f | p = %.3g",
+  fval,
+  r2,
+  pval
+)
+
+# Visualización
+p_aitchison <- plotReducedDim(
+  tse_clr,
+  "PCoA_aitchison",
+  colour_by = "diagnostico_principal",
+  point_size = 3
+)
+
+# Plot final
+p_aitchison +
+  scale_color_manual(values = paleta_dx) +
+  theme_pubr() +
+  labs(
+    title = "PCoA Aitchison (CLR)",
+    subtitle = subtitulo,
+    color = "Diagnóstico"
+  )
+```
+
+El **PCoA** basado en la distancia de **Aitchison** (utilizando la transformación CLR) evalúa la beta diversidad abordando la naturaleza composicional de los datos de secuenciación. En consonancia con las métricas anteriores, la prueba de **PERMANOVA** (*adonis2*) confirma la **ausencia de diferencias estadísticas significativas** en la estructura global de la microbiota entre los grupos (p = 0.305). El diagnóstico principal explica únicamente el **6.8%** de la varianza total (R^2 = 0.068), dejando el 93.1% restante a la variabilidad intrínseca interindividual y un solapamiento de muestras sin formar clústeres independientes.
+
+
+## UMAP - paquete uwot
+
+Con el objetivo de explorar posibles agrupamientos entre muestras, se aplica el *algoritmo UMAP* utilizando la implementación del paquete **uwot**.
+
+```{r UMAP_uwot}
+library(uwot)
+
+mat <- t(assay(tse, "relabundance"))
+
+set.seed(123)
+umap_res <- umap(
+  mat,
+  n_neighbors = 5  # Probar 1, 3, 5, 7
+)
+
+df_umap <- as.data.frame(umap_res)
+df_umap$diagnostico_principal <- colData(tse)$diagnostico_principal
+
+ggplot(df_umap, aes(V1, V2, color = diagnostico_principal)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = paleta_dx) +
+  theme_pubr() +
+  labs(title = "UMAP (uwot)")
+```
+
+El gráfico de reducción de dimensionalidad no lineal **UMAP** corrobora de manera visual los resultados previos de las métricas de beta diversidad 
+**(Bray-Curtis, Jaccard y Aitchison)**. Aunque esta técnica es altamente sensible para capturar estructuras complejas y agrupamientos locales en los datos de la microbiota, se observa que los puntos representativos de los cuatro grupos **(Healthy, VHC, HAI y CBP)** aparecen dispersos de forma homogénea y mezclados en todas las agrupaciones que proyecta el mapa. Esta falta de separación por colores confirma de manera definitiva que **el diagnóstico principal no es un factor determinante en la conformación de la microbiota intestinal**, prevaleciendo la variabilidad interindividual de los pacientes sobre el estado de la patología hepática.
+
+
+## UMAP - ecosistema Miaverse
+
+Para comparar la representación obtenida previamente y reforzar la confirmación realizada, también se realiza un segundo análisis UMAP utilizando las funciones integradas de *Miaverse*.
+  
+```{r UMAP_miaverse}
+# UMAP usando función runUMAP de miaverse.
+
+tse_umap <- transformAssay(tse, method = "relabundance")
+
+set.seed(123)
+tse_umap <- runUMAP(
+  tse_umap,
+  assay.type = "relabundance",
+  n_neighbors = 5,   # puedes probar 1, 3, 5, 7
+  name = "UMAP_relabundance"
+)
+
+# Plot
+p_umap <- plotReducedDim(
+  tse_umap,
+  "UMAP_relabundance",
+  colour_by = "diagnostico_principal",
+  point_size = 3
+)
+
+p_umap +
+  scale_color_manual(values = paleta_dx) +
+  theme_pubr() +
+  labs(title = "UMAP (miaverse)")
+```
+
+# **Agrupación por género**
+
+Finalmente, los datos se *agrupan a nivel de género* y se seleccionan los *10 géneros con mayor abundancia relativa media* para representar su distribución entre muestras y diagnósticos.
+
+```{r}
+tse_genus <- agglomerateByRank(tse, rank="Genus")
+tse_genus <- tse_genus[rowData(tse_genus)$Genus!="",]
+tse_genus <- transformAssay(tse_genus, method="relabundance")
+
+abund_mean <- rowMeans(assay(tse_genus,"relabundance"))
+top10 <- names(sort(abund_mean,decreasing=TRUE))[1:10]
+
+tse_genus_top <- tse_genus[top10,]
+
+plotAbundance(tse_genus_top,
+              assay.type="relabundance",
+              rank="Genus",
+              order_sample_by="diagnostico_principal") +
+  theme_pubr(base_size=8) +
+  theme(axis.text.x=element_text(angle=90,hjust=1)) +
+  labs(title    = "Top 10 Géneros Bacterianos más abundantes",
+    subtitle = "Ordenado por diagnóstico principal (Abundancia Relativa)")
+```
+
+Este gráfico de barras apiladas revela un perfil taxonómico caracterizado por el dominio absoluto y generalizado del género ***Burkholderia***, el cual representa más del 50% —y frecuentemente hasta el 95%— de la abundancia relativa en casi todas las muestras. La variabilidad interindividual restante está marcada por géneros secundarios que emergen de forma notable en sujetos específicos, destacando picos de ***Corynebacterium*** y ***Propionibacterium***, mientras que una comunidad minoritaria y heterogénea de bacterias como *Staphylococcus*, *Streptococcus*, *Sphingomonas* y *Methylobacterium* complementa la base del ecosistema.
