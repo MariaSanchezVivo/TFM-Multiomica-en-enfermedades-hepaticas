@@ -1,6 +1,6 @@
-# TFM - Análisis multi-ómico en enfermedades hepáticas
+# TFM - Análisis multiómico en enfermedades hepáticas
 
-Este repositorio contiene los scripts y análisis desarrollados para el Trabajo Fin de Máster (TFM), centrado en el estudio integrado de datos de microbiota intestinal y metabolómica en enfermedades hepáticas (hepatitis C crónica, hepatitis autoinmune y colangitis biliar primaria).
+Este repositorio contiene los scripts y análisis desarrollados para el Trabajo Fin de Máster (TFM), centrado en el estudio integrado de datos de microbiota hepática y metabolómica en enfermedades hepáticas (hepatitis C crónica, hepatitis autoinmune y colangitis biliar primaria).
 
 ---
 
@@ -13,8 +13,8 @@ El objetivo de este trabajo es caracterizar los patrones multiómicos diferencia
 ## Contenido del repositorio
 
 - **Scripts de análisis (.Rmd)**: contienen los principales flujos de trabajo en R junto con sus correspondientes salidas en HTML.
-- **Carpeta `metaboanalyst_results/`**: resultados de análisis de enriquecimiento funcional basados en bases de datos KEGG y Gut Microbiota–Host interactions.
-- **Carpeta `figures/`**: visualizaciones generadas durante el análisis que no están incluidas en el informe principal.
+- **Carpeta `MetaboAnalyst/`**: resultados de análisis de enriquecimiento funcional basados en las bases de datos KEGG y Gut Microbiota–Host.
+- **Carpeta `DIABLO_graphics/`**: visualizaciones generadas durante el análisis que no están incluidas en el informe principal.
 
 ---
 
