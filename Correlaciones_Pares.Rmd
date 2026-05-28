@@ -1,0 +1,517 @@
+---
+title: "Correlaciones por pares"
+author: "María Sánchez Vivo"
+date: "2026-05-25"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# **Introducción**
+
+El análisis de correlaciones entre variables clínicas, metabolitos y bacterias se realizó empleando distintos métodos estadísticos según la naturaleza de las variables comparadas. Para las **asociaciones entre variables numéricas se utilizó la correlación de Spearman** mediante la función Hmisc::rcorr, mientras que las **asociaciones entre variables categóricas se evaluaron mediante el estadístico V de Cramér** usando vcd::assocstats. En los casos en los que se analizaron **variables numéricas frente a variables categóricas dicotómicas, se aplicó la correlación de Pearson punto-biserial**. Las variables numéricas no fueron escaladas previamente, ya que la correlación de Spearman se basa en rangos y, por tanto, el escalado resulta redundante, mientras que la correlación punto-biserial de Pearson es invariante frente a transformaciones lineales. Para controlar el error asociado a comparaciones múltiples, los valores de p se ajustaron mediante corrección FDR (Benjamini–Hochberg), aplicada de forma global a cada bloque de correlaciones antes de seleccionar aquellas consideradas significativas.
+
+
+## Carga de datos y preparación del dataset integrado
+
+En este apartado se cargan las librerías necesarias y se importan los distintos conjuntos de datos correspondientes a metabolitos, microbiota y variables clínicas. Después, se integran en un único marco de análisis, eliminando variables redundantes y asegurando la correcta alineación de muestras. A continuación, se construyen las matrices finales de trabajo para variables clínicas, metabolitos y bacterias filtradas, además de definir subconjuntos de variables numéricas y categóricas relevantes para el análisis de correlaciones.
+
+```{r librerias_datos}
+library(Hmisc)
+library(vcd)
+library(corrplot)
+library(tidyverse)
+library(mia)
+library(TreeSummarizedExperiment)
+
+#Carga de datos 
+datos_metabolitos     <- readRDS("metabolitos.rds")
+datos_metataxonomicos <- readRDS("tax.rds")
+datos_clinicos        <- readRDS("covs.rds")
+datos_abundancia_16S  <- readRDS("metagen.rds")
+
+datos_clinicos_limpios <- datos_clinicos %>%
+  as.data.frame() %>%
+  select(-ends_with("_0"))
+
+datos_clinicos_metabolomicos <- merge(
+  datos_clinicos_limpios,
+  datos_metabolitos,
+  by = "Sample"
+)
+
+nombres_metabolitos <- names(datos_metabolitos)[
+  names(datos_metabolitos) != "Sample"
+]
+```
+
+
+## Construcción de la matriz microbiana y filtrado de géneros
+
+A continuación, se reconstruye el objeto de microbiota a partir de las abundancias originales, transformándolo a abundancia relativa y agrupándolo a nivel de género. Después, se filtran los taxones menos informativos en función de criterios de prevalencia y abundancia media, reduciendo ruido y mejorando la potencia estadística del análisis.
+
+```{r tse}
+# Reconstruir TSE y tse_genus ───────────────────────────────────────────────
+counts_prepared <- datos_abundancia_16S %>%
+  column_to_rownames("Sample") %>%
+  t() %>%
+  as.matrix()
+
+colnames(counts_prepared) <- trimws(colnames(counts_prepared))
+
+datos_clinicos_mia <- as.data.frame(datos_clinicos)
+rownames(datos_clinicos_mia) <- trimws(
+  as.character(datos_clinicos_mia$Sample)
+)
+
+tax_prepared <- datos_metataxonomicos %>%
+  as.data.frame() %>%
+  as.matrix()
+
+rownames(tax_prepared) <- trimws(rownames(tax_prepared))
+
+comun_muestras <- intersect(
+  colnames(counts_prepared),
+  rownames(datos_clinicos_mia)
+)
+
+counts_filtrado  <- counts_prepared[, comun_muestras]
+clinicos_final   <- datos_clinicos_mia[comun_muestras, ]
+comun_taxones    <- intersect(rownames(counts_filtrado), rownames(tax_prepared))
+counts_final     <- counts_filtrado[comun_taxones, ]
+tax_final        <- tax_prepared[comun_taxones, ]
+
+tse <- TreeSummarizedExperiment(
+  assays  = list(counts = as.matrix(counts_final)),
+  colData = DataFrame(clinicos_final),
+  rowData = DataFrame(tax_final)
+)
+
+tse        <- transformAssay(tse, method = "relabundance")
+tse_genus  <- agglomerateByRank(tse, rank = "Genus")
+tse_genus  <- tse_genus[rowData(tse_genus)$Genus != "", ]
+tse_genus  <- transformAssay(tse_genus, method = "relabundance")
+
+
+# Filtrar géneros prevalentes ───────────────────────────────────────────────
+# Umbral: prevalencia ≥ 20 % de muestras Y abundancia relativa media ≥ 0.1 %
+# Elimina géneros raros que solo aportarían ruido y tests sin potencia
+
+prevalencia <- rowMeans(assay(tse_genus, "relabundance") > 0)
+abund_media <- rowMeans(assay(tse_genus, "relabundance"))
+generos_filt  <- names(which(prevalencia >= 0.2 & abund_media >= 0.001))
+tse_genus_filt <- tse_genus[generos_filt, ]
+mat_bacterias  <- t(assay(tse_genus_filt, "relabundance"))
+
+
+# Alinear muestras ──────────────────────────────────────────────────────────
+muestras_comun <- intersect(
+  rownames(mat_bacterias),
+  datos_clinicos_metabolomicos$Sample
+)
+
+mat_bacterias_al <- mat_bacterias[muestras_comun, ]
+
+df_base <- datos_clinicos_metabolomicos %>%
+  filter(Sample %in% muestras_comun) %>%
+  arrange(match(Sample, muestras_comun))
+```
+
+## Selección y estructuración de variables clínicas
+
+En este apartado se identifican y separan las variables clínicas en numéricas y categóricas binarias, eliminando aquellas con baja variabilidad. Posteriormente, se alinean todas las matrices (clínica, metabolómica y bacteriana) para asegurar la comparabilidad entre muestras en los análisis de correlación.
+
+```{r variables_clinicas}
+# Selección de variables clínicas 
+vars_id <- c("Sample", "diagnostico_principal")
+
+# Variables numéricas
+vars_num_clin <- df_base %>%
+  select(-all_of(vars_id), -all_of(nombres_metabolitos)) %>%
+  select(where(is.numeric)) %>%
+  select(where(~ n_distinct(., na.rm = TRUE) >= 2)) %>%
+  names()
+
+# Variables categóricas binarias
+vars_cat_clin <- df_base %>%
+  select(-all_of(vars_id), -all_of(nombres_metabolitos)) %>%
+  select(where(~ is.factor(.) | is.character(.))) %>%
+  select(where(~ n_distinct(., na.rm = TRUE) == 2)) %>%
+  names()
+
+
+# Matrices finales ──────────────────────────────────────────────────────────
+mat_num_clin <- as.matrix(df_base[, vars_num_clin])
+mat_met      <- as.matrix(df_base[, nombres_metabolitos])
+mat_bact     <- mat_bacterias_al
+
+# Variables categóricas: se preserva el factor tal como viene 
+mat_cat_clin <- df_base %>%
+  select(all_of(vars_cat_clin)) %>%
+  mutate(across(everything(), as.factor))
+
+cat("Variables clínicas numéricas:", length(vars_num_clin), "\n")
+cat("Variables clínicas categóricas binarias:", length(vars_cat_clin), "\n")
+cat("Metabolitos:", length(nombres_metabolitos), "\n")
+cat("Géneros filtrados:", ncol(mat_bact), "\n")
+cat("Muestras comunes:", length(muestras_comun), "\n")
+```
+
+# **Funciones de correlación**
+
+A continuación, se definen las funciones necesarias para calcular las distintas asociaciones entre variables según su naturaleza. Se incluye una función de seguridad para variables binarias que evita errores de codificación. Después, se implementan funciones específicas para **correlaciones de Spearman (numéricas), V de Cramer (categóricas) y Pearson punto-biserial (numéricas vs binarias)**, además de una función integradora que construye matrices completas de correlación y aplica **corrección por FDR** para controlar el error por múltiples comparaciones.
+
+```{r funciones_correlacion}
+safe_binary_num <- function(x) {
+  x <- as.factor(x)
+  lvls <- levels(x)
+  if (length(lvls) != 2) {
+    stop("safe_binary_num: la variable no es binaria (", length(lvls), " niveles)")
+  }
+  # nivel[1] → 0  (NO)
+  # nivel[2] → 1  (SÍ)
+  as.integer(x == lvls[2])
+}
+
+
+# Spearman entre matrices numéricas ─────────────────────────────────────────
+spearman_block <- function(mat_x, mat_y) {
+  
+  res <- rcorr(mat_x, mat_y, type = "spearman")
+  nx  <- ncol(mat_x)
+  ny  <- ncol(mat_y)
+  
+  list(
+    r = res$r[1:nx, (nx + 1):(nx + ny), drop = FALSE],
+    p = res$P[1:nx, (nx + 1):(nx + ny), drop = FALSE]
+  )
+}
+
+
+# Cramér's V entre variables categóricas: está en el rango [0, 1], por ello is.corr = FALSE, para que la escala de colores no se centre en 0 de forma engañosa.
+# En heatmap, los valores altos (rojo) indican asociación fuerte sin información sobre la dirección.
+
+cramer_block <- function(cat_x, cat_y) {
+  
+  r_mat <- matrix(
+    NA,
+    nrow = ncol(cat_x), ncol = ncol(cat_y),
+    dimnames = list(names(cat_x), names(cat_y))
+  )
+  p_mat <- r_mat
+  
+  for (i in names(cat_x)) {
+    for (j in names(cat_y)) {
+      
+      tab <- table(cat_x[[i]], cat_y[[j]])
+      if (nrow(tab) < 2 || ncol(tab) < 2) next
+      
+      as_  <- assocstats(tab)
+      r_mat[i, j] <- as_$cramer
+      p_mat[i, j] <- chisq.test(
+        tab,
+        simulate.p.value = TRUE,
+        B = 2000
+      )$p.value
+    }
+  }
+  
+  list(r = r_mat, p = p_mat)
+}
+
+
+# Pearson: numéricas × categóricas binarias ──────────────────
+# Usa safe_binary_num() para garantizar que la dirección del coeficiente
+
+pearson_num_cat <- function(mat_num, cat_df) {
+  
+  r_mat <- matrix(
+    NA,
+    nrow = ncol(mat_num), ncol = ncol(cat_df),
+    dimnames = list(colnames(mat_num), names(cat_df))
+  )
+  p_mat <- r_mat
+  
+  for (num_v in colnames(mat_num)) {
+    for (cat_v in names(cat_df)) {
+      
+      cat_num <- safe_binary_num(cat_df[[cat_v]])   
+      
+      if (var(cat_num, na.rm = TRUE) == 0) next
+      
+      test <- cor.test(
+        mat_num[, num_v],
+        cat_num,
+        method = "pearson"
+      )
+      
+      r_mat[num_v, cat_v] <- test$estimate
+      p_mat[num_v, cat_v] <- test$p.value
+    }
+  }
+  
+  list(r = r_mat, p = p_mat)
+}
+
+
+# Ensamblar matriz combinada (num + cat en cada eje) ────────────────────────
+construir_matriz_combinada <- function(
+    bloque_num_x,
+    bloque_cat_x,
+    bloque_num_y,
+    bloque_cat_y
+) {
+  
+  resultados <- list()
+  
+  if (!is.null(bloque_num_x) && !is.null(bloque_num_y))
+    resultados[["nn"]] <- spearman_block(bloque_num_x, bloque_num_y)
+  
+  if (!is.null(bloque_cat_x) && !is.null(bloque_cat_y))
+    resultados[["cc"]] <- cramer_block(bloque_cat_x, bloque_cat_y)
+  
+  if (!is.null(bloque_num_x) && !is.null(bloque_cat_y))
+    resultados[["nc"]] <- pearson_num_cat(bloque_num_x, bloque_cat_y)
+  
+  if (!is.null(bloque_cat_x) && !is.null(bloque_num_y))
+    resultados[["cn"]] <- pearson_num_cat(bloque_num_y, bloque_cat_x)
+  
+  vars_x <- c(
+    if (!is.null(bloque_num_x)) colnames(bloque_num_x),
+    if (!is.null(bloque_cat_x)) names(bloque_cat_x)
+  )
+  vars_y <- c(
+    if (!is.null(bloque_num_y)) colnames(bloque_num_y),
+    if (!is.null(bloque_cat_y)) names(bloque_cat_y)
+  )
+  
+  r_full <- matrix(0, nrow = length(vars_x), ncol = length(vars_y),
+                   dimnames = list(vars_x, vars_y))
+  p_full <- matrix(1, nrow = length(vars_x), ncol = length(vars_y),
+                   dimnames = list(vars_x, vars_y))
+  
+  rellenar <- function(mat, bloque, filas, cols) {
+    f <- intersect(rownames(bloque), filas)
+    c <- intersect(colnames(bloque), cols)
+    if (length(f) > 0 && length(c) > 0) mat[f, c] <- bloque[f, c]
+    mat
+  }
+  
+  if (!is.null(resultados[["nn"]])) {
+    r_full <- rellenar(r_full, resultados[["nn"]]$r,
+                       colnames(bloque_num_x), colnames(bloque_num_y))
+    p_full <- rellenar(p_full, resultados[["nn"]]$p,
+                       colnames(bloque_num_x), colnames(bloque_num_y))
+  }
+  if (!is.null(resultados[["cc"]])) {
+    r_full <- rellenar(r_full, resultados[["cc"]]$r,
+                       names(bloque_cat_x), names(bloque_cat_y))
+    p_full <- rellenar(p_full, resultados[["cc"]]$p,
+                       names(bloque_cat_x), names(bloque_cat_y))
+  }
+  if (!is.null(resultados[["nc"]])) {
+    r_full <- rellenar(r_full, resultados[["nc"]]$r,
+                       colnames(bloque_num_x), names(bloque_cat_y))
+    p_full <- rellenar(p_full, resultados[["nc"]]$p,
+                       colnames(bloque_num_x), names(bloque_cat_y))
+  }
+  if (!is.null(resultados[["cn"]])) {
+    r_full <- rellenar(r_full, t(resultados[["cn"]]$r),
+                       names(bloque_cat_x), colnames(bloque_num_y))
+    p_full <- rellenar(p_full, t(resultados[["cn"]]$p),
+                       names(bloque_cat_x), colnames(bloque_num_y))
+  }
+  
+  # FDR global aplicado a toda la matriz aplanada del bloque
+  p_full_adj <- matrix(
+    p.adjust(as.vector(p_full), method = "fdr"),
+    nrow = nrow(p_full), ncol = ncol(p_full),
+    dimnames = dimnames(p_full)
+  )
+  p_full_adj[is.na(p_full_adj)] <- 1
+  
+  list(r = r_full, p = p_full_adj)
+}
+```
+
+
+## Funciones de visualización de correlaciones
+
+En este apartado se definen las funciones encargadas de representar las matrices de correlación mediante heatmaps. Se incluyen dos versiones: una que muestra todas las asociaciones con indicación de significancia estadística y otra que filtra únicamente las correlaciones significativas tras corrección FDR, facilitando la interpretación de los resultados.
+
+```{r}
+# Heatmap completo: todas las correlaciones, significativas marcadas con * ──
+plot_corrblock <- function(mat_r, mat_p, titulo) {
+  
+  colnames(mat_r) <- gsub("^Genus:", "", colnames(mat_r))
+  colnames(mat_p) <- gsub("^Genus:", "", colnames(mat_p))
+  
+  corrplot(
+    mat_r,
+    is.corr   = FALSE,          # Necesario: la matriz no es [-1,1]
+    method    = "color",
+    p.mat     = mat_p,
+    sig.level = c(0.001, 0.01, 0.05),
+    insig     = "label_sig",
+    pch.cex   = 1,
+    col       = colorRampPalette(c("#377EB8", "white", "#E41A1C"))(200),
+    tl.col    = "black",
+    tl.srt    = 60,
+    tl.cex    = 0.6,
+    cl.ratio  = 0.1,
+    cl.length = 5,
+    title     = titulo,
+    mar       = c(2, 4, 4, 2)
+  )
+}
+
+
+# Heatmap reducido: solo correlaciones con FDR < alpha ─────────────────────
+plot_corrblock_sig <- function(mat_r, mat_p, titulo, alpha = 0.05) {
+  
+  filas_keep <- rowSums(mat_p < alpha, na.rm = TRUE) > 0
+  cols_keep  <- colSums(mat_p < alpha, na.rm = TRUE) > 0
+  
+  mat_r_sub <- mat_r[filas_keep, cols_keep, drop = FALSE]
+  mat_p_sub <- mat_p[filas_keep, cols_keep, drop = FALSE]
+  
+  if (nrow(mat_r_sub) == 0 || ncol(mat_r_sub) == 0) {
+    message("Sin asociaciones significativas en: ", titulo)
+    return(invisible(NULL))
+  }
+  
+  colnames(mat_r_sub) <- gsub("^Genus:", "", colnames(mat_r_sub))
+  colnames(mat_p_sub) <- gsub("^Genus:", "", colnames(mat_p_sub))
+  
+  corrplot(
+    mat_r_sub,
+    is.corr   = FALSE,
+    method    = "color",
+    type      = "full",
+    p.mat     = mat_p_sub,
+    sig.level = alpha,
+    insig     = "blank",
+    col       = colorRampPalette(c("#377EB8", "white", "#E41A1C"))(200),
+    tl.col    = "black",
+    tl.srt    = 60,
+    tl.cex    = 0.8,
+    cl.ratio  = 0.12,
+    cl.length = 5,
+    mar       = c(2, 2, 4, 2),
+    title     = paste0(titulo, " (FDR < ", alpha, ")")
+  )
+}
+
+```
+
+
+# **Cálculo de correlaciones**
+
+Se calculan las asociaciones entre los distintos niveles de información. En primer lugar, se evalúan las correlaciones entre **variables clínicas y metabolitos**, seguidas de las asociaciones entre **variables clínicas y bacterias**. Finalmente, se calculan las correlaciones entre **metabolitos y bacterias** mediante Spearman, aplicando corrección FDR para controlar la significación estadística global de los resultados.
+
+```{r calculo_correlaciones}
+
+cat("\n=== Par 1: Clínica × Metabolitos ===\n")
+res_clin_met <- construir_matriz_combinada(
+  bloque_num_x = mat_num_clin,
+  bloque_cat_x = mat_cat_clin,
+  bloque_num_y = mat_met,
+  bloque_cat_y = NULL
+)
+cat("Sig. clínica×metabolitos (FDR<0.05):",
+    sum(res_clin_met$p < 0.05, na.rm = TRUE), "\n")
+
+cat("\n=== Par 2: Clínica × Bacterias ===\n")
+res_clin_bact <- construir_matriz_combinada(
+  bloque_num_x = mat_num_clin,
+  bloque_cat_x = mat_cat_clin,
+  bloque_num_y = mat_bact,
+  bloque_cat_y = NULL
+)
+cat("Sig. clínica×bacterias (FDR<0.05):",
+    sum(res_clin_bact$p < 0.05, na.rm = TRUE), "\n")
+
+cat("\n=== Par 3: Metabolitos × Bacterias (Spearman puro) ===\n")
+res_met_bact <- spearman_block(mat_met, mat_bact)
+p_adj_mb <- matrix(
+  p.adjust(as.vector(res_met_bact$p), method = "fdr"),
+  nrow = nrow(res_met_bact$p),
+  ncol = ncol(res_met_bact$p),
+  dimnames = dimnames(res_met_bact$p)
+)
+p_adj_mb[is.na(p_adj_mb)] <- 1
+cat("Sig. metabolitos×bacterias (FDR<0.05):",
+    sum(p_adj_mb < 0.05, na.rm = TRUE), "\n")
+```
+
+Estos resultados demuestran que la enfermedad hepática actúa como el motor principal que conecta todo, mostrando una relación muy fuerte y directa con los cambios químicos del cuerpo **(121 asociaciones en Clínica × Metabolitos)** y un impacto moderado pero claro en la composición del microbioma **(28 asociaciones en Clínica × Bacterias)**. Sin embargo, la falta total de correlaciones directas **entre metabolitos y bacterias (0 asociaciones)** revela que estos dos componentes no se comunican de forma lineal ni directa entre sí, sino que ambos cambian de manera independiente como respuesta al estado de salud general del paciente o a la inflamación de su hígado.
+
+
+# **Visualizaciones**
+
+## Visualizaciones de correlaciones completas
+
+En este apartado se generan los mapas de calor completos que representan **todas las correlaciones calculadas entre los distintos bloques de datos** (clínica–metabolitos, clínica–bacterias y metabolitos–bacterias), marcando las asociaciones significativas (*) para facilitar su interpretación global.
+
+```{r plot_completo_clin_met, fig.width=20, fig.height=20}
+par(mar = c(2, 2, 3, 1))
+plot_corrblock(res_clin_met$r, res_clin_met$p,
+               "Clínica - Metabolitos —> todas las correlaciones")
+```
+
+Este mapa de correlación detalla de forma visual las **121 asociaciones significativas** detectadas entre las variables clínicas (filas) y los metabolitos (columnas), donde la intensidad del color representa la fuerza de la correlación (rojo para positivas, azul para negativas) y los asteriscos (`*`) señalan la significancia estadística tras corregir por FDR. Destaca de manera muy clara un bloque superior con densas correlaciones positivas (tonos rojos intensos y abundantes asteriscos) que vincula parámetros de biopsia e histología hepática —como `a1_final_mm2`, `a2_inicial_mm2` y `media_a1_a2`— con una amplia variedad de aminoácidos y ácidos orgánicos (como leucina_isoleucina y tirosina). Asimismo, marcadores clave de daño hepatocelular en sangre como la `bilirrubina_total`, `alt` (ALAT) y `ast` (ASAT) muestran una correlación positiva directa con metabolitos específicos del ciclo de la urea y del metabolismo energético. Este patrón confirma que **a mayor severidad del daño tisular, inflamación y disfunción del hígado, mayor es la acumulación o liberación sistémica de estos biomarcadores metabólicos**, validando la estrecha relación patofisiológica que existe entre la clínica del paciente y su estado metabólico.
+
+```{r plot_completo_clin_bact, fig.width=20, fig.height=20}
+par(mar = c(2, 2, 3, 1))
+plot_corrblock(res_clin_bact$r, res_clin_bact$p,
+               "Clínica - Bacterias —> todas las correlaciones")
+```
+
+Este mapa de correlación espacializa las **28 asociaciones significativas** identificadas entre las variables clínicas (filas) y los géneros bacterianos (columnas), mostrando una matriz mucho más dispersa y tenue que la observada con los metabolitos, lo que refleja un **vínculo más débil y localizado entre la clínica y el microbioma**. El gráfico está dominado por un fondo mayoritariamente blanco y de tonos muy pálidos, con asteriscos (`*`) puntuales que señalan interacciones muy específicas: destacan algunas correlaciones positivas (rojo) aisladas entre rasgos histológicos de daño tisular (como la **zonación de la inflamación** o la **presencia de esteatosis**) y taxones específicos, así como asociaciones discretas con variables demográficas o de tratamiento. Este patrón disperso confirma visualmente que, si bien existen **alteraciones en la microbiota ligadas al avance de las hepatopatías, estas no responden de manera masiva o uniforme a la gravedad de la enfermedad**, sino que se manifiestan a través de cambios puntuales en géneros específicos, conviviendo con una alta variabilidad individual.
+
+
+
+```{r plot_completo_met_bact, fig.width=14, fig.height=14}
+par(mar = c(2, 2, 3, 1))
+plot_corrblock(res_met_bact$r, p_adj_mb,
+               "Metabolitos - Bacterias —> todas las correlaciones (Spearman + FDR)")
+```
+
+Este mapa de correlación visualiza las relaciones de Spearman entre metabolitos y géneros bacterianos, ofreciendo el reflejo gráfico perfecto de por qué se obtuvieron **0 asociaciones significativas** tras la corrección por FDR. Aunque se observan parches azules y rojo moderados (con coeficientes débiles que oscilan apenas entre -0.55 y 0.53), la **ausencia total de asteriscos** en toda la cuadrícula confirma que ninguna de estas tendencias es estadísticamente robusta. La dispersión cromática sin un patrón definido ni bloques consolidados demuestra de forma visual que las **fluctuaciones del microbioma y del metaboloma no están acopladas de manera directa**; en su lugar, **ambos sistemas se comportan de forma independiente debido a la enorme variabilidad individual**, reafirmando que cualquier vínculo entre ellos está mediado indirectamente por el estado clínico global del paciente.
+
+
+## Visualización de correlaciones significativas
+
+Después, se generan mapas de calor reducidos que muestran únicamente las asociaciones estadísticamente significativas tras corrección FDR, permitiendo identificar de forma más clara las relaciones biológicamente relevantes entre variables clínicas, metabolitos y bacterias.
+
+
+### Significativos Clínica - Metabolitos
+
+```{r plot_sig_clin_met, fig.width=14, fig.height=10, fig.align='center'}
+par(mar = c(2, 2, 2, 1))
+plot_corrblock_sig(res_clin_met$r, res_clin_met$p,
+                   "Clínica × Metabolitos")
+```
+
+Este mapa de calor filtrado muestra **exclusivamente las 121 asociaciones estadísticamente significativas (FDR < 0.05)** entre las variables clínicas y los metabolitos, eliminando todo el ruido visual de las correlaciones no válidas. En el gráfico resalta un bloque superior rojo intenso muy consolidado, confirmando que los parámetros histológicos de la biopsia hepática (`a1_final_mm2`, `a2_inicial_mm2`, `media_a1_a2` y `comprimento_da_biopsia_mm`) poseen una correlación positiva con la elevación de compuestos clave en el metabolismo como `choline`, `carnitine`, `hypoxanthine`, `succinate` y `methylmalonic_acid`, evidenciando una **asociación entre las características estructurales de la biopsia y la alteración de rutas metabólicas** (como vías mitocondriales, del ciclo de la urea y del metabolismo lipídico en el tejido hepático). Asimismo, se observan asociaciones positivas específicas y limpias para las enzimas hepáticas (`ast`, `alt`) y marcadores de gravedad o tratamiento inmunosupresor (uso previo de ciclosporina, tacrolimus o everolimus), mientras que variables de anticuerpos como `ama_1` muestran correlaciones negativas muy puntuales; todo lo cual ratifica de forma definitiva que **el daño celular y el estado patológico del hígado dirigen directamente la firma metabólica sistémica del paciente**.
+
+
+### Significativos Clínica - Bacterias
+
+```{r plot_sig_clin_bact, fig.width=12, fig.height=7}
+par(mar = c(2, 2, 3, 1))
+plot_corrblock_sig(res_clin_bact$r, res_clin_bact$p,
+                   "Clínica × Bacterias")
+```
+
+
+Este mapa de calor filtrado expone las **28 asociaciones estadísticamente significativas (FDR < 0.05)** entre las variables clínicas y los géneros bacterianos, eliminando el ruido del análisis global. A diferencia de la masiva respuesta metabólica, aquí se observa un patrón de interacciones muy específico y fragmentado (todas de carácter positivo), donde destacan correlaciones clave; por ejemplo, la presencia de `colestase_intralobular` se asocia significativamente con los géneros *Streptococcus*, *Prevotella*, *Veillonella* y *Haemophilus*, mientras que procesos inflamatorios severos como la `emperipolese_1` o la inflamación en la interfaz portal correlacionan fuertemente con incrementos de *Bacillus*, *Enterococcus* y *Arthrobacter*. Asimismo, se evidencian huellas del impacto de la terapia inmunosupresora previa a la biopsia (con el uso de everolimus, ciclosporina o micofenolato) sobre el enriquecimiento de géneros específicos como *Arthrobacter*, confirmando que **el microbioma responde de manera puntual y dirigida tanto a nichos patofisiológicos específicos de la lesión hepática como a las intervenciones médicas recibidas**.
+
+
