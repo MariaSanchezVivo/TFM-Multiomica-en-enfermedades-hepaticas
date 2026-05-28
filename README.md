@@ -23,7 +23,7 @@ El objetivo de este trabajo es caracterizar los patrones multiómicos diferencia
 - Análisis estadístico descriptivo e inferencial
 - Análisis de microbiota intestinal (diversidad y composición taxonómica)
 - Agrupación taxonómica a nivel de Phylum
-- Análisis exploratorio no supervisado (PCA, UMAP, t-SNE)
+- Análisis exploratorio no supervisado (PCA, UMAP)
 - Análisis de correlación entre variables ómicas
 - Integración multi-ómica mediante MOFA+ y DIABLO
 
