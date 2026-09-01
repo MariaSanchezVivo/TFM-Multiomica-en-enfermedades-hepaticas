@@ -578,7 +578,7 @@ Después, se estima el número óptimo de componentes mediante validación cruza
 # MODELO INICIAL - estimacion numero de componentes
 
 # near.zero.var = TRUE para que DIABLO gestione las constantes en los folds
-diablo_inicial <- block.plsda(X, Y, ncomp = 3, design = design, near.zero.var = TRUE)
+diablo_inicial <- block.plsda(X, Y, ncomp = 5, design = design, near.zero.var = TRUE)
 
 perf_diablo <- perf(diablo_inicial, validation = "Mfold",
                     folds        = 3,
@@ -644,14 +644,52 @@ cat("Modelo DIABLO final ajustado.\n")
 # VISUALIZACIONES DIABLO
 
 # Individuos en espacio latente consenso
-plotIndiv(diablo_final,
-          ind.names     = FALSE,
-          group         = Y,
-          legend        = TRUE,
-          ellipse       = FALSE,
-          col.per.group = paleta_dx,
-          rep.space     = "XY-variance",
-          title         = "DIABLO - Muestras en espacio latente consenso")
+# Extraer coordenadas de cada bloque
+bloques <- c("metabolitos", "microbiota", "clinica")
+
+df_plot <- do.call(rbind, lapply(bloques, function(b) {
+  data.frame(
+    x      = diablo_final$variates[[b]][, 1],
+    y      = diablo_final$variates[[b]][, 2],
+    grupo  = as.character(Y),
+    bloque = b
+  )
+}))
+
+df_plot$bloque <- factor(df_plot$bloque, levels = bloques)
+df_plot$grupo  <- factor(df_plot$grupo,  levels = c("Healthy", "VHC", "HAI", "CBP"))
+
+paleta_dx <- c(
+  "Healthy" = "#4DAF4A",
+  "VHC"     = "#FF7F00",
+  "HAI"     = "#377EB8",
+  "CBP"     = "#E41A1C"
+)
+
+simbolos <- c("Healthy" = 4, "VHC" = 3, "HAI" = 1, "CBP" = 2)
+
+ggplot(df_plot, aes(x = x, y = y, color = grupo, shape = grupo)) +
+  geom_point(size = 3, stroke= 1.0, alpha = 0.85) +
+  facet_wrap(~ bloque, ncol = 2, scales = "free",
+             labeller = labeller(bloque = c(
+               metabolitos = "Block: metabolitos",
+               microbiota  = "Block: microbiota",
+               clinica     = "Block: clinica"
+             ))) +
+  scale_color_manual(name = "Diagnóstico", values = paleta_dx) +
+  scale_shape_manual(name = "Diagnóstico", values = simbolos) +
+  theme_bw() +
+  labs(
+    title = "DIABLO - Muestras en espacio latente consenso",
+    x     = "variate 1",
+    y     = "variate 2"
+  ) +
+  theme(
+    legend.position  = "right",
+    strip.background = element_rect(fill = "grey85"),
+    strip.text       = element_text(face = "bold"),
+    aspect.ratio     = 1   # fuerza paneles cuadrados
+  )
 
 # Variables (correlacion con componentes)
 plotVar(diablo_final,
